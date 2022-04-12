@@ -1,0 +1,67 @@
+name: Build (Linux)
+
+on:
+  push:
+    paths:
+      - 'source/*'
+      - '.github/workflows/linux.yml'
+  workflow_dispatch:
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-20.04
+    steps:
+    - name: Checkout repo
+      uses: actions/checkout@v2
+      with:
+        fetch-depth: 0
+
+    - name: Setup GCC
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y g++-11
+
+    - name: Setup oneMKL
+      run: |
+        wget -O- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB | gpg --dearmor | sudo tee /usr/share/keyrings/oneapi-archive-keyring.gpg > /dev/null
+        echo "deb [signed-by=/usr/share/keyrings/oneapi-archive-keyring.gpg] https://apt.repos.intel.com/oneapi all main" | sudo tee /etc/apt/sources.list.d/oneAPI.list
+        sudo apt update
+        sudo apt install intel-oneapi-mkl-devel
+
+    - name: Download VapourSynth headers
+      run: |
+        wget -q -O vs.zip https://github.com/vapoursynth/vapoursynth/archive/refs/tags/R57.zip
+        unzip -q vs.zip
+        mv vapoursynth*/ vapoursynth
+
+    - name: Download vector class library
+      run: |
+        wget -q -O vcl.zip https://github.com/vectorclass/version2/archive/refs/tags/v2.01.04.zip
+        unzip -q vcl.zip
+        mv version2*/ vectorclass
+
+    - name: Setup Ninja
+      run: pip install ninja
+
+    - name: Configure
+      run: cmake -S . -B build -G Ninja -LA
+        -D CMAKE_BUILD_TYPE=Release
+        -D CMAKE_CXX_FLAGS="-Wall -mavx2 -mfma"
+        -D MKL_LINK=static -D MKL_THREADING=sequential -D MKL_INTERFACE=lp64
+        -D VCL_HOME="`pwd`/vectorclass"
+        -D VS_INCLUDE_DIR="`pwd`/vapoursynth/include"
+      env:
+        CXX: g++-11
+
+    - name: Build
+      run: cmake --build build --verbose
+
+    - name: Install
+      run: cmake --install build --prefix install
+
+    # - name: Upload
+    #   uses: actions/upload-artifact@v2
+    #   with:
+    #     name: wnnm-linux
+    #     path: install/lib/*.so
+
