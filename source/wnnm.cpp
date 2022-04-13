@@ -46,8 +46,8 @@ struct Workspace {
     int * svd_iwork;
 
     void init(
-        int width, int height, 
-        int block_size, int group_size, int bm_range, 
+        int width, int height,
+        int block_size, int group_size, int bm_range,
         bool residual, bool fast,
         int svd_lda, int svd_ldu, int svd_ldvt, int svd_lwork
     ) noexcept {
@@ -147,9 +147,9 @@ static inline Vec8i make_mask(int block_size_m8) noexcept {
 #endif
 
 template<bool residual, bool fast>
-static inline void bm_sorted(std::vector<std::tuple<float, int, int>> & errors, const float * VS_RESTRICT srcp, 
-    int width, int x, int y, int top, int bottom, int left, int right, int block_size, int group_size, 
-    int stride, float * VS_RESTRICT denoising_patch, float * VS_RESTRICT mean_patch, 
+static inline void bm_sorted(std::vector<std::tuple<float, int, int>> & errors, const float * VS_RESTRICT srcp,
+    int width, int x, int y, int top, int bottom, int left, int right, int block_size, int group_size,
+    int stride, float * VS_RESTRICT denoising_patch, float * VS_RESTRICT mean_patch,
     float * VS_RESTRICT current_patch, int svd_lda, bool * VS_RESTRICT denoised) noexcept {
 
     errors.clear();
@@ -425,14 +425,14 @@ static inline void bm_sorted(std::vector<std::tuple<float, int, int>> & errors, 
 
                 {
                     Vec8f vec_src = _mm256_maskload_ps(src_patchp, mask);
-                    vec_src.store(denoising_patchp); // denoising_patch is padded 
+                    vec_src.store(denoising_patchp); // denoising_patch is padded
                     src_patchp += stride - (block_size & (-8));
                     denoising_patchp += block_size & 7;
 
                     if constexpr (residual) {
                         Vec8f vec_mean = Vec8f().load(mean_patchp);
                         vec_mean += vec_src;
-                        vec_mean.store(mean_patchp); // mean_patch is padded 
+                        vec_mean.store(mean_patchp); // mean_patch is padded
                         mean_patchp += block_size & 7;
                     }
                 }
@@ -477,9 +477,9 @@ static inline void bm_sorted(std::vector<std::tuple<float, int, int>> & errors, 
 }
 
 template<bool residual, bool fast>
-static inline void bm_full(const float * VS_RESTRICT src, 
-    int width, int x, int y, int top, int bottom, int left, int right, int block_size, 
-    int stride, float * VS_RESTRICT denoising_patch, float * VS_RESTRICT mean_patch, 
+static inline void bm_full(const float * VS_RESTRICT src,
+    int width, int x, int y, int top, int bottom, int left, int right, int block_size,
+    int stride, float * VS_RESTRICT denoising_patch, float * VS_RESTRICT mean_patch,
     int svd_lda, bool * VS_RESTRICT denoised) noexcept {
 
     src += top * stride;
@@ -524,7 +524,7 @@ static inline void bm_full(const float * VS_RESTRICT src,
     }
 }
 
-static inline void bm_post(float * VS_RESTRICT mean_patch, float * VS_RESTRICT denoising_patch, 
+static inline void bm_post(float * VS_RESTRICT mean_patch, float * VS_RESTRICT denoising_patch,
     int block_size, int group_size, int num_neighbours, int svd_lda) noexcept {
 
     // substract group mean
@@ -542,18 +542,18 @@ static inline void bm_post(float * VS_RESTRICT mean_patch, float * VS_RESTRICT d
 }
 
 template<bool residual>
-static inline WnnmInfo patch_estimation(float * VS_RESTRICT wdst, float * VS_RESTRICT weight, float & adaptive_weight,  
-    float sigma, 
-    int block_size, int group_size, int num_neighbours, float * VS_RESTRICT denoising_patch, 
-    float * VS_RESTRICT mean_patch, int svd_lda, 
-    float * VS_RESTRICT svd_s, float * VS_RESTRICT svd_u, int svd_ldu, 
-    float * VS_RESTRICT svd_vt, int svd_ldvt, float * VS_RESTRICT svd_work, int svd_lwork, 
+static inline WnnmInfo patch_estimation(float * VS_RESTRICT wdst, float * VS_RESTRICT weight, float & adaptive_weight,
+    float sigma,
+    int block_size, int group_size, int num_neighbours, float * VS_RESTRICT denoising_patch,
+    float * VS_RESTRICT mean_patch, int svd_lda,
+    float * VS_RESTRICT svd_s, float * VS_RESTRICT svd_u, int svd_ldu,
+    float * VS_RESTRICT svd_vt, int svd_ldvt, float * VS_RESTRICT svd_work, int svd_lwork,
     int * VS_RESTRICT svd_iwork, bool adaptive_aggregation) noexcept {
 
     int m = square(block_size);
     int n = VSMIN(num_neighbours, group_size);
 
-    int svd_info = LAPACKE_sgesdd_work(LAPACK_COL_MAJOR, 'S', m, n, denoising_patch, svd_lda, 
+    int svd_info = LAPACKE_sgesdd_work(LAPACK_COL_MAJOR, 'S', m, n, denoising_patch, svd_lda,
         svd_s, svd_u, svd_ldu, svd_vt, svd_ldvt, svd_work, svd_lwork, svd_iwork);
 
     if (svd_info != 0) {
@@ -568,7 +568,7 @@ static inline WnnmInfo patch_estimation(float * VS_RESTRICT wdst, float * VS_RES
         k = 0;
     }
 
-    for ( ; k < VSMIN(m, n); ++k) { 
+    for ( ; k < VSMIN(m, n); ++k) {
         float s = svd_s[k];
         float tmp = square(s) - constant;
         if (tmp > 0.f) {
@@ -610,8 +610,8 @@ static inline WnnmInfo patch_estimation(float * VS_RESTRICT wdst, float * VS_RES
         }
     }
 
-    cblas_sgemm(CblasColMajor, CblasNoTrans, CblasNoTrans, 
-        m, n, k, 1.0f, svd_u, svd_ldu, svd_vt, svd_ldvt, 0.f, 
+    cblas_sgemm(CblasColMajor, CblasNoTrans, CblasNoTrans,
+        m, n, k, 1.0f, svd_u, svd_ldu, svd_vt, svd_ldvt, 0.f,
         denoising_patch, svd_lda);
 
     if constexpr (residual) {
@@ -627,9 +627,9 @@ static inline WnnmInfo patch_estimation(float * VS_RESTRICT wdst, float * VS_RES
     return WnnmInfo::SUCCESS;
 }
 
-static void patch_estimation_skip1_sorted(float * VS_RESTRICT wdst, float * VS_RESTRICT weight, 
-    const float * VS_RESTRICT src, 
-    const std::vector<std::tuple<float, int, int>> & errors, int width, 
+static void patch_estimation_skip1_sorted(float * VS_RESTRICT wdst, float * VS_RESTRICT weight,
+    const float * VS_RESTRICT src,
+    const std::vector<std::tuple<float, int, int>> & errors, int width,
     int stride, int block_size, int group_size) noexcept {
 
     for (int i = 0; i < group_size; ++i) {
@@ -650,12 +650,12 @@ static void patch_estimation_skip1_sorted(float * VS_RESTRICT wdst, float * VS_R
             weightp += width;
         }
     }
-} 
+}
 
-static void patch_estimation_skip1_full(float * VS_RESTRICT wdst, float * VS_RESTRICT weight, 
-    const float * VS_RESTRICT src, 
-    int left, int right, int top, int bottom, int width, int stride, 
-    int block_size) noexcept { 
+static void patch_estimation_skip1_full(float * VS_RESTRICT wdst, float * VS_RESTRICT weight,
+    const float * VS_RESTRICT src,
+    int left, int right, int top, int bottom, int width, int stride,
+    int block_size) noexcept {
 
     src += top * stride;
     wdst += top * width;
@@ -685,8 +685,8 @@ static void patch_estimation_skip1_full(float * VS_RESTRICT wdst, float * VS_RES
     }
 }
 
-static inline void patch_estimation_skip2_sorted(float * VS_RESTRICT wdst, float * VS_RESTRICT weight, 
-    const std::vector<std::tuple<float, int, int>> & errors, int width, 
+static inline void patch_estimation_skip2_sorted(float * VS_RESTRICT wdst, float * VS_RESTRICT weight,
+    const std::vector<std::tuple<float, int, int>> & errors, int width,
     int block_size, int group_size, const float * VS_RESTRICT mean_patch) noexcept {
 
     for (int i = 0; i < group_size; ++i) {
@@ -709,8 +709,8 @@ static inline void patch_estimation_skip2_sorted(float * VS_RESTRICT wdst, float
     }
 }
 
-static inline void patch_estimation_skip2_full(float * VS_RESTRICT wdst, float * VS_RESTRICT weight, 
-    int left, int right, int top, int bottom, int width, 
+static inline void patch_estimation_skip2_full(float * VS_RESTRICT wdst, float * VS_RESTRICT weight,
+    int left, int right, int top, int bottom, int width,
     int block_size, const float * VS_RESTRICT mean_patch) noexcept {
 
     wdst += top * width;
@@ -739,9 +739,9 @@ static inline void patch_estimation_skip2_full(float * VS_RESTRICT wdst, float *
     }
 }
 
-static inline void col2im_sorted(float * VS_RESTRICT wdst, float * VS_RESTRICT weight, 
-    const std::vector<std::tuple<float, int, int>> & errors, int width, 
-    int block_size, int group_size, const float * VS_RESTRICT denoising_patch, 
+static inline void col2im_sorted(float * VS_RESTRICT wdst, float * VS_RESTRICT weight,
+    const std::vector<std::tuple<float, int, int>> & errors, int width,
+    int block_size, int group_size, const float * VS_RESTRICT denoising_patch,
     int svd_lda, float adaptive_weight) noexcept {
 
     for (int i = 0; i < group_size; ++i) {
@@ -765,9 +765,9 @@ static inline void col2im_sorted(float * VS_RESTRICT wdst, float * VS_RESTRICT w
     }
 }
 
-static inline void col2im_full(float * VS_RESTRICT wdst, float * VS_RESTRICT weight, 
-    int top, int bottom, int left, int right, int width, 
-    int block_size, const float * VS_RESTRICT denoising_patch, 
+static inline void col2im_full(float * VS_RESTRICT wdst, float * VS_RESTRICT weight,
+    int top, int bottom, int left, int right, int width,
+    int block_size, const float * VS_RESTRICT denoising_patch,
     int svd_lda, float adaptive_weight) noexcept {
 
     wdst += top * width;
@@ -797,8 +797,8 @@ static inline void col2im_full(float * VS_RESTRICT wdst, float * VS_RESTRICT wei
     }
 }
 
-static inline void aggregation(float * VS_RESTRICT dstp, const float * VS_RESTRICT srcp, 
-    int width, int height, int stride, const float * VS_RESTRICT wdst, 
+static inline void aggregation(float * VS_RESTRICT dstp, const float * VS_RESTRICT srcp,
+    int width, int height, int stride, const float * VS_RESTRICT wdst,
     const float * VS_RESTRICT weight) noexcept {
 
 #ifdef __AVX2__
@@ -864,8 +864,8 @@ static void process(const VSFrameRef * src, VSFrameRef * dst, WNNMData * d, cons
 
     if (!init) {
         workspace.init(
-            d->vi->width, d->vi->height, 
-            d->block_size, d->group_size, d->bm_range, d->residual, d->fast, 
+            d->vi->width, d->vi->height,
+            d->block_size, d->group_size, d->bm_range, d->residual, d->fast,
             d->svd_lda, d->svd_ldu, d->svd_ldvt, d->svd_lwork
         );
 
@@ -961,11 +961,11 @@ static void process(const VSFrameRef * src, VSFrameRef * dst, WNNMData * d, cons
                     int num_neighbours = (bottom - top + 1) * (right - left + 1);
 
                     if (num_neighbours > group_size) {
-                        bm_sorted<residual, fast>(errors, srcp, width, x, y, top, bottom, left, right, 
-                            block_size, group_size, stride, denoising_patch, mean_patch, current_patch, 
+                        bm_sorted<residual, fast>(errors, srcp, width, x, y, top, bottom, left, right,
+                            block_size, group_size, stride, denoising_patch, mean_patch, current_patch,
                             svd_lda, denoised);
                     } else {
-                        bm_full<residual, fast>(srcp, width, x, y, top, bottom, left, right, 
+                        bm_full<residual, fast>(srcp, width, x, y, top, bottom, left, right,
                             block_size, stride, denoising_patch, mean_patch, svd_lda, denoised);
                     }
 
@@ -976,18 +976,18 @@ static void process(const VSFrameRef * src, VSFrameRef * dst, WNNMData * d, cons
 
                     // patch_estimation with early skipping on SVD exception
                     float adaptive_weight = 1.f;
-                    WnnmInfo info = patch_estimation<residual>(wdst, weight, adaptive_weight, d->sigma[plane], 
-                        block_size, group_size, num_neighbours, denoising_patch, mean_patch, svd_lda, 
-                        svd_s, svd_u, svd_ldu, svd_vt, svd_ldvt, svd_work, svd_lwork, svd_iwork, 
+                    WnnmInfo info = patch_estimation<residual>(wdst, weight, adaptive_weight, d->sigma[plane],
+                        block_size, group_size, num_neighbours, denoising_patch, mean_patch, svd_lda,
+                        svd_s, svd_u, svd_ldu, svd_vt, svd_ldvt, svd_work, svd_lwork, svd_iwork,
                         adaptive_aggregation);
 
                     switch (info) {
                         case WnnmInfo::SUCCESS: {
                             if (num_neighbours > group_size) {
-                                col2im_sorted(wdst, weight, errors, width, 
+                                col2im_sorted(wdst, weight, errors, width,
                                     block_size, group_size, denoising_patch, svd_lda, adaptive_weight);
                             } else {
-                                col2im_full(wdst, weight, top, bottom, left, right, width, 
+                                col2im_full(wdst, weight, top, bottom, left, right, width,
                                     block_size, denoising_patch, svd_lda, adaptive_weight);
                             }
                             break;
@@ -995,10 +995,10 @@ static void process(const VSFrameRef * src, VSFrameRef * dst, WNNMData * d, cons
 
                         case WnnmInfo::FAILURE: {
                             if (num_neighbours > group_size) {
-                                patch_estimation_skip1_sorted(wdst, weight, srcp, 
+                                patch_estimation_skip1_sorted(wdst, weight, srcp,
                                     errors, width, stride, block_size, group_size);
                             } else {
-                                patch_estimation_skip1_full(wdst, weight, srcp, 
+                                patch_estimation_skip1_full(wdst, weight, srcp,
                                     left, right, top, bottom, width, stride, block_size);
                             }
                             break;
@@ -1006,10 +1006,10 @@ static void process(const VSFrameRef * src, VSFrameRef * dst, WNNMData * d, cons
 
                         case WnnmInfo::EMPTY: {
                             if (num_neighbours > group_size) {
-                                patch_estimation_skip2_sorted(wdst, weight, 
+                                patch_estimation_skip2_sorted(wdst, weight,
                                     errors, width, block_size, group_size, mean_patch);
                             } else {
-                                patch_estimation_skip2_full(wdst, weight, 
+                                patch_estimation_skip2_full(wdst, weight,
                                     left, right, top, bottom, width, block_size, mean_patch);
                             }
                             break;
@@ -1200,8 +1200,8 @@ static void VS_CC WNNMCreate(const VSMap *in, VSMap *out, void *userData, VSCore
 
 VS_EXTERNAL_API(void) VapourSynthPluginInit(VSConfigPlugin configFunc, VSRegisterFunction registerFunc, VSPlugin *plugin) {
     configFunc(
-        "com.WolframRhodium.WNNM", 
-        "wnnm", "Weighted nuclear norm minimization denoiser", 
+        "com.WolframRhodium.WNNM",
+        "wnnm", "Weighted Nuclear Norm Minimization Denoiser",
         VAPOURSYNTH_API_VERSION, 1, plugin
     );
 
