@@ -641,7 +641,7 @@ static void patch_estimation_skip1_sorted(float * VS_RESTRICT wdst, float * VS_R
 
         for (int patch_y = 0; patch_y < block_size; ++patch_y) {
             for (int patch_x = 0; patch_x < block_size; ++patch_x) {
-                wdstp[patch_x] += src[patch_x];
+                wdstp[patch_x] += srcp[patch_x];
                 weightp[patch_x] += 1.f;
             }
 
