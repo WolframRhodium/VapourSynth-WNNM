@@ -1,6 +1,6 @@
 #include <algorithm>
-#include <cmath>
 #include <cfloat>
+#include <cmath>
 #include <shared_mutex>
 #include <stdexcept>
 #include <string>
@@ -10,7 +10,8 @@
 #include <vector>
 
 // MKL
-#include <mkl.h>
+#include <mkl_blas.h>
+#include <mkl_lapack.h>
 
 #ifdef __AVX2__
 #include <vectorclass.h>
@@ -553,8 +554,8 @@ static inline WnnmInfo patch_estimation(float * VS_RESTRICT wdst, float * VS_RES
     int m = square(block_size);
     int n = VSMIN(num_neighbours, group_size);
 
-    int svd_info = LAPACKE_sgesdd_work(LAPACK_COL_MAJOR, 'S', m, n, denoising_patch, svd_lda,
-        svd_s, svd_u, svd_ldu, svd_vt, svd_ldvt, svd_work, svd_lwork, svd_iwork);
+    int svd_info;
+    sgesdd("S", &m, &n, denoising_patch, &svd_lda, svd_s, svd_u, &svd_ldu, svd_vt, &svd_ldvt, svd_work, &svd_lwork, svd_iwork, &svd_info);
 
     if (svd_info != 0) {
         return WnnmInfo::FAILURE;
@@ -610,9 +611,9 @@ static inline WnnmInfo patch_estimation(float * VS_RESTRICT wdst, float * VS_RES
         }
     }
 
-    cblas_sgemm(CblasColMajor, CblasNoTrans, CblasNoTrans,
-        m, n, k, 1.0f, svd_u, svd_ldu, svd_vt, svd_ldvt, 0.f,
-        denoising_patch, svd_lda);
+    constexpr float alpha = 1.0f;
+    constexpr float beta = 0.0f;
+    sgemm("N", "N", &m, &n, &k, &alpha, svd_u, &svd_ldu, svd_vt, &svd_ldvt, &beta, denoising_patch, &svd_lda);
 
     if constexpr (residual) {
         for (int i = 0; i < VSMIN(num_neighbours, group_size); ++i) {
@@ -1190,10 +1191,6 @@ static void VS_CC WNNMCreate(const VSMap *in, VSMap *out, void *userData, VSCore
     int svd_m = square(d->block_size);
     int svd_n = VSMIN(d->group_size, square(2 * d->bm_range + 1));
     d->svd_lwork = VSMIN(svd_m, svd_n) * (6 + 4 * VSMIN(svd_m, svd_n)) + VSMAX(svd_m, svd_n);
-
-    if (d->fast) {
-        LAPACKE_set_nancheck(0);
-    }
 
     vsapi->createFilter(in, out, "WNNM", WNNMInit, WNNMGetFrame, WNNMFree, fmParallel, 0, d.release(), core);
 }
