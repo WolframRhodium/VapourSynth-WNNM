@@ -2,6 +2,7 @@
 #include <cfloat>
 #include <cmath>
 #include <shared_mutex>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -12,6 +13,7 @@
 // MKL
 #include <mkl_blas.h>
 #include <mkl_lapack.h>
+#include <mkl_service.h>
 #include <mkl_version.h>
 
 #ifdef __AVX2__
@@ -1218,7 +1220,18 @@ VS_EXTERNAL_API(void) VapourSynthPluginInit(VSConfigPlugin configFunc, VSRegiste
 
     auto getVersion = [](const VSMap *, VSMap * out, void *, VSCore *, const VSAPI *vsapi) {
         vsapi->propSetData(out, "version", VERSION, -1, paReplace);
-        vsapi->propSetData(out, "mkl_version", std::to_string(INTEL_MKL_VERSION).c_str(), -1, paReplace);
+
+        vsapi->propSetData(out, "mkl_version_build", std::to_string(INTEL_MKL_VERSION).c_str(), -1, paReplace);
+
+        MKLVersion version;
+        mkl_get_version(&version);
+
+        vsapi->propSetData(out, "mkl_processor", version.Processor, -1, paReplace);
+
+        std::ostringstream mkl_version_str;
+        mkl_version_str << version.MajorVersion << '.' << version.MinorVersion << '.' << version.UpdateVersion;
+
+        vsapi->propSetData(out, "mkl_version", mkl_version_str.str().c_str(), -1, paReplace);
     };
     registerFunc("Version", "", getVersion, nullptr, plugin);
 }
