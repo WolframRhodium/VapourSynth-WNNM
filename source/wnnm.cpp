@@ -12,6 +12,7 @@
 // MKL
 #include <mkl_blas.h>
 #include <mkl_lapack.h>
+#include <mkl_version.h>
 
 #ifdef __AVX2__
 #include <vectorclass.h>
@@ -1217,6 +1218,7 @@ VS_EXTERNAL_API(void) VapourSynthPluginInit(VSConfigPlugin configFunc, VSRegiste
 
     auto getVersion = [](const VSMap *, VSMap * out, void *, VSCore *, const VSAPI *vsapi) {
         vsapi->propSetData(out, "version", VERSION, -1, paReplace);
+        vsapi->propSetData(out, "mkl_version", std::to_string(INTEL_MKL_VERSION).c_str(), -1, paReplace);
     };
     registerFunc("Version", "", getVersion, nullptr, plugin);
 }
