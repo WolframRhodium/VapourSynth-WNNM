@@ -13,7 +13,7 @@ Requires floating point input. Each plane is denoised separately.
 
 ```bash
 cmake -S . -B build -D CMAKE_BUILD_TYPE=Release \
--D MKL_LINK=static -D MKL_THREADING=sequential
+-D MKL_LINK=static -D MKL_THREADING=sequential -D MKL_INTERFACE=lp64
 
 cmake --build build
 
