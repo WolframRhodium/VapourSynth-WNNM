@@ -56,8 +56,14 @@ struct Workspace {
         int svd_lda, int svd_ldu, int svd_ldvt, int svd_lwork
     ) noexcept {
 
+#ifdef __AVX2__
+        constexpr int pad = 7;
+#else
+        constexpr int pad = 0;
+#endif
+
         if (residual) {
-            mean_patch = vs_aligned_malloc<float>(sizeof(float) * m16(square(block_size)), 64);
+            mean_patch = vs_aligned_malloc<float>(sizeof(float) * (square(block_size) + pad), 64);
         } else {
             mean_patch = nullptr;
         }
@@ -68,7 +74,7 @@ struct Workspace {
             denoised = nullptr;
         }
 
-        current_patch = vs_aligned_malloc<float>(sizeof(float) * m16(square(block_size)), 64);
+        current_patch = vs_aligned_malloc<float>(sizeof(float) * (square(block_size) + pad), 64);
 
         wdst = vs_aligned_malloc<float>(sizeof(float) * height * width, 64);
 
@@ -77,7 +83,7 @@ struct Workspace {
         int m = square(block_size);
         int n = VSMIN(group_size, square(2 * bm_range + 1));
 
-        denoising_patch = vs_aligned_malloc<float>(sizeof(float) * svd_lda * n, 64);
+        denoising_patch = vs_aligned_malloc<float>(sizeof(float) * (svd_lda * n + pad), 64);
 
         svd_s = vs_aligned_malloc<float>(sizeof(float) * VSMIN(m, n), 64);
 
