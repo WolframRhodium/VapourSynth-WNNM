@@ -571,7 +571,7 @@ static inline WnnmInfo patch_estimation(float * VS_RESTRICT wdst, float * VS_RES
     }
 
     // WNNP with parameter epsilon ignored
-    float constant = 8.f * sqrtf(2.f) * sqrtf(static_cast<float>(n)) * static_cast<float>(square(sigma));
+    float constant = 8.f * sqrtf(2.0f * n) * square(sigma);
 
     int k = 1;
     if constexpr (residual) {
@@ -1199,7 +1199,21 @@ static void VS_CC WNNMCreate(const VSMap *in, VSMap *out, void *userData, VSCore
 
     int svd_m = square(d->block_size);
     int svd_n = VSMIN(d->group_size, square(2 * d->bm_range + 1));
-    d->svd_lwork = VSMIN(svd_m, svd_n) * (6 + 4 * VSMIN(svd_m, svd_n)) + VSMAX(svd_m, svd_n);
+    // d->svd_lwork = VSMIN(svd_m, svd_n) * (6 + 4 * VSMIN(svd_m, svd_n)) + VSMAX(svd_m, svd_n);
+    // query
+    float svd_work;
+    constexpr int svd_lwork = -1;
+    int info;
+    sgesdd(
+        "S", &svd_m, &svd_n,
+        nullptr, &d->svd_lda, nullptr, nullptr, &d->svd_ldu, nullptr, &d->svd_ldvt,
+        &svd_work, &svd_lwork,
+        nullptr, &info
+    );
+    if (info != 0) {
+        return set_error("sgesdd() workspace query failed");
+    }
+    d->svd_lwork = static_cast<int>(svd_work);
 
     vsapi->createFilter(in, out, "WNNM", WNNMInit, WNNMGetFrame, WNNMFree, fmParallel, 0, d.release(), core);
 }
