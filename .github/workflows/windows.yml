@@ -28,12 +28,12 @@ jobs:
       uses: actions/cache@v2
       with:
         path: C:\Program Files (x86)\Intel\oneAPI\mkl
-        key: ${{ runner.os }}-onemkl-2022.0.3
+        key: ${{ runner.os }}-onemkl-2022.1.0
 
     - name: Setup oneMKL
       if: steps.cache-onemkl.outputs.cache-hit != 'true'
       run: |
-        curl -s -o onemkl.exe -L https://registrationcenter-download.intel.com/akdlm/irc_nas/18590/w_onemkl_p_2022.0.3.171_offline.exe
+        curl -s -o onemkl.exe -L https://registrationcenter-download.intel.com/akdlm/IRC_NAS/18723/w_onemkl_p_2022.1.0.192_offline.exe
         onemkl.exe -s -a --silent --eula accept
 
     - name: Download VapourSynth headers
@@ -54,7 +54,7 @@ jobs:
     - name: Setup LLVM
       shell: bash
       run: |
-        curl -s -o llvm-win64.exe -LJO https://github.com/llvm/llvm-project/releases/download/llvmorg-14.0.0/LLVM-14.0.0-win64.exe
+        curl -s -o llvm-win64.exe -LJO https://github.com/llvm/llvm-project/releases/download/llvmorg-14.0.4/LLVM-14.0.4-win64.exe
         7z x -ollvm llvm-win64.exe
 
     - name: Configure
