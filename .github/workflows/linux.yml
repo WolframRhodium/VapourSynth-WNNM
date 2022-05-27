@@ -61,7 +61,7 @@ jobs:
 
     - name: Upload
       uses: actions/upload-artifact@v2
-      if: false
+      if: true
       with:
         name: wnnm-linux
         path: install/lib/*.so
