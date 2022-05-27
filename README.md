@@ -4,7 +4,7 @@
 ## Usage
 Prototype:
 
-`core.wnnm.WNNM(clip clip[, float[] sigma = 3.0, int block_size = 8, int block_step = 8, int group_size = 8, int bm_range = 7, bool residual = false, bool adaptive_aggregation = true, bool fast = false])`
+`core.wnnm.WNNM(clip clip[, float[] sigma = 3.0, int block_size = 8, int block_step = 8, int group_size = 8, int bm_range = 7, int radius = 0, int ps_num = 2, int ps_range = 4, bool residual = false, bool adaptive_aggregation = true])`
 
 Requires floating point input. Each plane is denoised separately.
 
