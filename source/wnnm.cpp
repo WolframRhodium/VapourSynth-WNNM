@@ -1,6 +1,12 @@
 #include <algorithm>
+#include <array>
+#include <cassert>
 #include <cfloat>
 #include <cmath>
+#include <cstddef>
+#include <cstring>
+#include <limits>
+#include <iterator>
 #include <shared_mutex>
 #include <sstream>
 #include <stdexcept>
@@ -26,33 +32,34 @@
 
 #include <config.h>
 
+static VSPlugin * myself = nullptr;
+
 template <typename T>
-static inline T square(T const & x) {
+static inline T square(T const & x) noexcept {
     return x * x;
 }
 
 static inline int m16(int x) noexcept {
+    assert(x > 0);
     return ((x - 1) / 16 + 1) * 16;
 }
 
 namespace {
 struct Workspace {
-    bool * denoised;
-    float * wdst;
-    float * weight;
-    float * denoising_patch;
-    float * mean_patch;
-    float * current_patch;
-    float * svd_s;
-    float * svd_u;
-    float * svd_vt;
-    float * svd_work;
-    int * svd_iwork;
+    float * intermediate; // [radius == 0] shape: (2, height, width)
+    float * denoising_patch; // shape: (group_size, svd_lda) + pad (simd_lanes - 1)
+    float * mean_patch; // [residual] shape: (block_size, block_size) + pad (simd_lanes - 1)
+    float * current_patch; // shape: (block_size, block_size) + pad (simd_lanes - 1)
+    float * svd_s; // shape: (min(square(block_size), group_size),)
+    float * svd_u; // shape: (min(square(block_size), group_size), svd_ldu)
+    float * svd_vt; // shape: (min(square(block_size), group_size), svd_ldvt)
+    float * svd_work; // shape: (svd_lwork,)
+    int * svd_iwork; // shape: (8 * min(square(block_size), group_size),)
 
     void init(
         int width, int height,
-        int block_size, int group_size, int bm_range,
-        bool residual, bool fast,
+        int block_size, int group_size, int bm_range, int radius,
+        bool residual,
         int svd_lda, int svd_ldu, int svd_ldvt, int svd_lwork
     ) noexcept {
 
@@ -63,54 +70,44 @@ struct Workspace {
 #endif
 
         if (residual) {
-            mean_patch = vs_aligned_malloc<float>(sizeof(float) * (square(block_size) + pad), 64);
+            mean_patch = vs_aligned_malloc<float>((square(block_size) + pad) * sizeof(float), 64);
         } else {
             mean_patch = nullptr;
         }
 
-        if (fast) {
-            denoised = vs_aligned_malloc<bool>(sizeof(bool) * height * width, 64);
+        current_patch = vs_aligned_malloc<float>((square(block_size) + pad) * sizeof(float), 64);
+
+        if (radius == 0) {
+            intermediate = reinterpret_cast<float *>(std::malloc(2 * height * width * sizeof(float)));
         } else {
-            denoised = nullptr;
+            intermediate = nullptr;
         }
 
-        current_patch = vs_aligned_malloc<float>(sizeof(float) * (square(block_size) + pad), 64);
-
-        wdst = vs_aligned_malloc<float>(sizeof(float) * height * width, 64);
-
-        weight = vs_aligned_malloc<float>(sizeof(float) * height * width, 64);
-
         int m = square(block_size);
-        int n = VSMIN(group_size, square(2 * bm_range + 1));
+        int n = group_size;
 
-        denoising_patch = vs_aligned_malloc<float>(sizeof(float) * (svd_lda * n + pad), 64);
+        denoising_patch = vs_aligned_malloc<float>((svd_lda * n + pad) * sizeof(float), 64);
 
-        svd_s = vs_aligned_malloc<float>(sizeof(float) * VSMIN(m, n), 64);
+        svd_s = vs_aligned_malloc<float>(std::min(m, n) * sizeof(float), 64);
 
-        svd_u = vs_aligned_malloc<float>(sizeof(float) * svd_ldu * VSMIN(m, n), 64);
+        svd_u = vs_aligned_malloc<float>(svd_ldu * std::min(m, n) * sizeof(float), 64);
 
-        svd_vt = vs_aligned_malloc<float>(sizeof(float) * svd_ldvt * n, 64);
+        svd_vt = vs_aligned_malloc<float>(svd_ldvt * n * sizeof(float), 64);
 
-        svd_work = vs_aligned_malloc<float>(sizeof(float) * svd_lwork, 64);
+        svd_work = vs_aligned_malloc<float>(svd_lwork * sizeof(float), 64);
 
-        svd_iwork = vs_aligned_malloc<int>(sizeof(int) * 8 * VSMIN(m, n), 64);
+        svd_iwork = vs_aligned_malloc<int>(8 * std::min(m, n) * sizeof(int), 64);
     }
 
     void release() noexcept {
         vs_aligned_free(mean_patch);
         mean_patch = nullptr;
 
-        vs_aligned_free(denoised);
-        denoised = nullptr;
-
         vs_aligned_free(current_patch);
         current_patch = nullptr;
 
-        vs_aligned_free(wdst);
-        wdst = nullptr;
-
-        vs_aligned_free(weight);
-        weight = nullptr;
+        std::free(intermediate);
+        intermediate = nullptr;
 
         vs_aligned_free(denoising_patch);
         denoising_patch = nullptr;
@@ -134,18 +131,18 @@ struct Workspace {
 
 struct WNNMData {
     VSNodeRef * node;
-    const VSVideoInfo * vi;
     float sigma[3];
     int block_size, block_step, group_size, bm_range;
-    int svd_lwork, svd_lda, svd_ldu, svd_ldvt;
+    int radius, ps_num, ps_range;
     bool process[3];
-    bool residual, adaptive_aggregation, fast;
+    bool residual, adaptive_aggregation;
+    int svd_lwork, svd_lda, svd_ldu, svd_ldvt;
 
     std::unordered_map<std::thread::id, Workspace> workspaces;
     std::shared_mutex workspaces_lock;
 };
 
-enum class WnnmInfo { SUCCESS, FAILURE, EMPTY };
+enum class WnnmInfo { SUCCESS, FAILURE };
 } // namespace
 
 #ifdef __AVX2__
@@ -156,66 +153,40 @@ static inline Vec8i make_mask(int block_size_m8) noexcept {
 }
 #endif
 
-template<bool residual, bool fast>
-static inline void bm_sorted(std::vector<std::tuple<float, int, int>> & errors, const float * VS_RESTRICT srcp,
-    int width, int x, int y, int top, int bottom, int left, int right, int block_size, int group_size,
-    int stride, float * VS_RESTRICT denoising_patch, float * VS_RESTRICT mean_patch,
-    float * VS_RESTRICT current_patch, int svd_lda, bool * VS_RESTRICT denoised) noexcept {
-
-    errors.clear();
-
-    {
-        float * VS_RESTRICT current_patchp = current_patch;
-        const float * VS_RESTRICT src_patchp = srcp + y * stride + x;
-
 #ifdef __AVX2__
-        if (block_size == 8) {
-            constexpr int block_size8 {8};
+namespace {
+enum class BlockSizeInfo { Is8, Mod8, General };
 
-            for (int patch_y = 0; patch_y < block_size8; ++patch_y) {
-                Vec8f vec_src = Vec8f().load(src_patchp);
-                vec_src.store_a(current_patchp);
+struct Empty {};
+}
 
-                src_patchp += stride;
-                current_patchp += 8;
-            }
-        } else if ((block_size & 7) == 0) { // block_size % 8 == 0
-            for (int patch_y = 0; patch_y < block_size; ++patch_y) {
-                for (int patch_x = 0; patch_x < block_size; patch_x += 8) {
-                    Vec8f vec_src = Vec8f().load(src_patchp);
-                    vec_src.store_a(current_patchp);
+template <BlockSizeInfo dispatch>
+static inline void compute_block_distances_avx2(
+    std::vector<std::tuple<float, int, int>> & errors,
+    const float * VS_RESTRICT current_patch,
+    const float * VS_RESTRICT neighbour_patch,
+    int top, int bottom, int left, int right,
+    int stride, int block_size
+) noexcept {
 
-                    src_patchp += 8;
-                    current_patchp += 8;
-                }
-                src_patchp += stride - block_size;
-            }
-        } else {
-#else
-        {
-#endif
-            for (int patch_y = 0; patch_y < block_size; ++patch_y) {
-                memcpy(current_patchp, src_patchp, sizeof(float) * block_size);
-                current_patchp += block_size;
-                src_patchp += stride;
-            }
-        }
+    if constexpr (dispatch == BlockSizeInfo::Is8) {
+        block_size = 8;
     }
 
-    const float * VS_RESTRICT neighbour_patchpc = srcp + top * stride;
+    [[maybe_unused]] std::conditional_t<dispatch == BlockSizeInfo::General, Vec8i, Empty> mask;
+    if constexpr (dispatch == BlockSizeInfo::General) {
+        mask = make_mask(block_size % 8);
+    }
 
-#ifdef __AVX2__
-    if (block_size == 8) {
-        constexpr int block_size8 {8};
+    for (int bm_y = top; bm_y <= bottom; ++bm_y) {
+        for (int bm_x = left; bm_x <= right; ++bm_x) {
+            Vec8f vec_error {0.f};
 
-        for (int bm_y = top; bm_y <= bottom; ++bm_y) {
-            for (int bm_x = left; bm_x <= right; ++bm_x) {
-                Vec8f vec_error {0.f};
+            const float * VS_RESTRICT current_patchp = current_patch;
+            const float * VS_RESTRICT neighbour_patchp = neighbour_patch;
 
-                const float * VS_RESTRICT current_patchp = current_patch;
-                const float * VS_RESTRICT neighbour_patchp = neighbour_patchpc + bm_x;
-
-                for (int patch_y = 0; patch_y < block_size8; ++patch_y) {
+            for (int patch_y = 0; patch_y < block_size; ++patch_y) {
+                if constexpr (dispatch == BlockSizeInfo::Is8) {
                     Vec8f vec_current = Vec8f().load_a(current_patchp);
                     Vec8f vec_neighbour = Vec8f().load(neighbour_patchp);
 
@@ -224,24 +195,7 @@ static inline void bm_sorted(std::vector<std::tuple<float, int, int>> & errors, 
 
                     current_patchp += 8;
                     neighbour_patchp += stride;
-                }
-
-                float error { horizontal_add(vec_error) };
-
-                errors.push_back(std::make_tuple(error, bm_x, bm_y));
-            }
-
-            neighbour_patchpc += stride;
-        }
-    } else if ((block_size & 7) == 0) { // block_size % 8 == 0 && block_size >= 16
-        for (int bm_y = top; bm_y <= bottom; ++bm_y) {
-            for (int bm_x = left; bm_x <= right; ++bm_x) {
-                Vec8f vec_error {0.f};
-
-                const float * VS_RESTRICT current_patchp = current_patch;
-                const float * VS_RESTRICT neighbour_patchp = neighbour_patchpc + bm_x;
-
-                for (int patch_y = 0; patch_y < block_size; ++patch_y) {
+                } else if constexpr (dispatch == BlockSizeInfo::Mod8) {
                     for (int patch_x = 0; patch_x < block_size; patch_x += 8) {
                         Vec8f vec_current = Vec8f().load_a(current_patchp);
                         Vec8f vec_neighbour = Vec8f().load(neighbour_patchp);
@@ -254,26 +208,7 @@ static inline void bm_sorted(std::vector<std::tuple<float, int, int>> & errors, 
                     }
 
                     neighbour_patchp += stride - block_size;
-                }
-
-                float error {horizontal_add(vec_error)};
-
-                errors.push_back(std::make_tuple(error, bm_x, bm_y));
-            }
-
-            neighbour_patchpc += stride;
-        }
-    } else { // block_size % 8 != 0
-        Vec8i mask { make_mask(block_size & 7) };
-
-        for (int bm_y = top; bm_y <= bottom; ++bm_y) {
-            for (int bm_x = left; bm_x <= right; ++bm_x) {
-                Vec8f vec_error {0.f};
-
-                const float * VS_RESTRICT current_patchp = current_patch;
-                const float * VS_RESTRICT neighbour_patchp = neighbour_patchpc + bm_x;
-
-                for (int patch_y = 0; patch_y < block_size; ++patch_y) {
+                } else if constexpr (dispatch == BlockSizeInfo::General) {
                     for (int patch_x = 0; patch_x < (block_size & (-8)); patch_x += 8) {
                         Vec8f vec_current = Vec8f().load(current_patchp);
                         Vec8f vec_neighbour = Vec8f().load(neighbour_patchp);
@@ -292,73 +227,273 @@ static inline void bm_sorted(std::vector<std::tuple<float, int, int>> & errors, 
                         Vec8f diff = vec_current - vec_neighbour;
                         vec_error = mul_add(diff, diff, vec_error);
 
-                        current_patchp += block_size & 7;
+                        current_patchp += block_size % 8;
                         neighbour_patchp += stride - (block_size & (-8));
                     }
                 }
-
-                float error {horizontal_add(vec_error)};
-
-                errors.push_back(std::make_tuple(error, bm_x, bm_y));
             }
 
-            neighbour_patchpc += stride;
+            float error { horizontal_add(vec_error) };
+
+            errors.emplace_back(std::make_tuple(error, bm_x, bm_y));
+
+            neighbour_patch++;
         }
+
+        neighbour_patch += stride - (right - left + 1);
     }
-#else
-    {
-        for (int bm_y = top; bm_y <= bottom; ++bm_y) {
-            for (int bm_x = left; bm_x <= right; ++bm_x) {
-                const float * VS_RESTRICT neighbour_patchp = neighbour_patchpc + bm_x;
-                float * VS_RESTRICT current_patchp {current_patch};
-                float error = 0.f;
+}
 
-                for (int patch_y = 0; patch_y < block_size; ++patch_y) {
-                    for (int patch_x = 0; patch_x < block_size; ++patch_x) {
-                        error += square(current_patchp[patch_x] - neighbour_patchp[patch_x]);
-                    }
+template <BlockSizeInfo dispatch>
+static inline void compute_block_distances_avx2(
+    std::vector<std::tuple<float, int, int>> & errors,
+    const float * VS_RESTRICT current_patch,
+    const float * VS_RESTRICT srcp,
+    const std::vector<std::tuple<int, int>> & search_positions,
+    int stride, int block_size
+) noexcept {
 
-                    current_patchp += block_size;
-                    neighbour_patchp += stride;
+    if constexpr (dispatch == BlockSizeInfo::Is8) {
+        block_size = 8;
+    }
+
+    [[maybe_unused]] std::conditional_t<dispatch == BlockSizeInfo::General, Vec8i, Empty> mask;
+    if constexpr (dispatch == BlockSizeInfo::General) {
+        mask = make_mask(block_size % 8);
+    }
+
+    for (const auto & [bm_x, bm_y]: search_positions) {
+        Vec8f vec_error {0.f};
+
+        const float * VS_RESTRICT current_patchp = current_patch;
+        const float * VS_RESTRICT neighbour_patchp = &srcp[bm_y * stride + bm_x];
+
+        for (int patch_y = 0; patch_y < block_size; ++patch_y) {
+            if constexpr (dispatch == BlockSizeInfo::Is8) {
+                Vec8f vec_current = Vec8f().load_a(current_patchp);
+                Vec8f vec_neighbour = Vec8f().load(neighbour_patchp);
+
+                Vec8f diff = vec_current - vec_neighbour;
+                vec_error = mul_add(diff, diff, vec_error);
+
+                current_patchp += 8;
+                neighbour_patchp += stride;
+            } else if constexpr (dispatch == BlockSizeInfo::Mod8) {
+                for (int patch_x = 0; patch_x < block_size; patch_x += 8) {
+                    Vec8f vec_current = Vec8f().load_a(current_patchp);
+                    Vec8f vec_neighbour = Vec8f().load(neighbour_patchp);
+
+                    Vec8f diff = vec_current - vec_neighbour;
+                    vec_error = mul_add(diff, diff, vec_error);
+
+                    current_patchp += 8;
+                    neighbour_patchp += 8;
                 }
 
-                errors.push_back(std::make_tuple(error, bm_x, bm_y));
+                neighbour_patchp += stride - block_size;
+            } else if constexpr (dispatch == BlockSizeInfo::General) {
+                for (int patch_x = 0; patch_x < (block_size & (-8)); patch_x += 8) {
+                    Vec8f vec_current = Vec8f().load(current_patchp);
+                    Vec8f vec_neighbour = Vec8f().load(neighbour_patchp);
+
+                    Vec8f diff = vec_current - vec_neighbour;
+                    vec_error = mul_add(diff, diff, vec_error);
+
+                    current_patchp += 8;
+                    neighbour_patchp += 8;
+                }
+
+                {
+                    Vec8f vec_current = _mm256_maskload_ps(current_patchp, mask);
+                    Vec8f vec_neighbour = _mm256_maskload_ps(neighbour_patchp, mask);
+
+                    Vec8f diff = vec_current - vec_neighbour;
+                    vec_error = mul_add(diff, diff, vec_error);
+
+                    current_patchp += block_size % 8;
+                    neighbour_patchp += stride - (block_size & (-8));
+                }
             }
-
-            neighbour_patchpc += stride;
         }
+
+        float error { horizontal_add(vec_error) };
+
+        errors.emplace_back(std::make_tuple(error, bm_x, bm_y));
     }
-#endif
+}
+#endif // __AVX2__
 
-    std::partial_sort(errors.begin(), errors.begin() + group_size, errors.end(), [](auto a, auto b){
-        return std::get<0>(a) < std::get<0>(b);
-    });
+static std::vector<std::tuple<int, int>> generate_search_locations(
+    const std::tuple<float, int, int> * center_positions, int num_center_positions,
+    int block_size, int width, int height, int bm_range
+) noexcept {
 
-    float * VS_RESTRICT denoising_patchp = denoising_patch;
+    std::vector<std::tuple<int, int>> search_locations;
+    std::vector<std::tuple<int, int>> new_locations;
+
+    for (int i = 0; i < num_center_positions; i++) {
+        const auto & [_, x, y] = center_positions[i];
+        int left = std::max(x - bm_range, 0);
+        int right = std::min(x + bm_range, width - block_size);
+        int top = std::max(y - bm_range, 0);
+        int bottom = std::min(y + bm_range, height - block_size);
+
+        new_locations.clear();
+        new_locations.reserve((bottom - top + 1) * (right - left + 1));
+        for (int j = top; j <= bottom; j++) {
+            for (int k = left; k <= right; k++) {
+                new_locations.emplace_back(std::make_tuple(k, j));
+            }
+        }
+
+        auto locations_copy = search_locations;
+
+        search_locations.reserve(std::size(search_locations) + std::size(new_locations));
+
+        search_locations.clear();
+
+        std::set_union(
+            std::cbegin(locations_copy), std::cend(locations_copy),
+            std::cbegin(new_locations), std::cend(new_locations),
+            std::back_inserter(search_locations),
+            [](const std::tuple<int, int> & a, const std::tuple<int, int> & b) -> bool {
+                auto [ax, ay] = a;
+                auto [bx, by] = b;
+                return ay < by || (ay == by && ax < bx);
+            }
+        );
+    }
+
+    return search_locations;
+}
+
+static inline void compute_block_distances(
+    std::vector<std::tuple<float, int, int>> & errors,
+    const float * VS_RESTRICT current_patch,
+    const float * VS_RESTRICT neighbour_patch,
+    int top, int bottom, int left, int right,
+    int stride,
+    int block_size
+) noexcept {
 
 #ifdef __AVX2__
     if (block_size == 8) {
-        constexpr int block_size8 {8};
+        return compute_block_distances_avx2<BlockSizeInfo::Is8>(errors, current_patch, neighbour_patch, top, bottom, left, right, stride, block_size);
+    } else if ((block_size % 8) == 0) {
+        return compute_block_distances_avx2<BlockSizeInfo::Mod8>(errors, current_patch, neighbour_patch, top, bottom, left, right, stride, block_size);
+    } else {
+        return compute_block_distances_avx2<BlockSizeInfo::General>(errors, current_patch, neighbour_patch, top, bottom, left, right, stride, block_size);
+    }
+#else // __AVX2__
+    for (int bm_y = top; bm_y <= bottom; ++bm_y) {
+        for (int bm_x = left; bm_x <= right; ++bm_x) {
+            float error = 0.f;
 
-        for (int i = 0; i < group_size; ++i) {
-            auto [error, bm_x, bm_y] = errors[i];
+            const float * VS_RESTRICT current_patchp = current_patch;
+            const float * VS_RESTRICT neighbour_patchp = neighbour_patch;
 
-            if constexpr (fast) {
-                denoised[bm_y * width + bm_x] = true;
+            for (int patch_y = 0; patch_y < block_size; ++patch_y) {
+                for (int patch_x = 0; patch_x < block_size; ++patch_x) {
+                    error += square(current_patchp[patch_x] - neighbour_patchp[patch_x]);
+                }
+
+                current_patchp += block_size;
+                neighbour_patchp += stride;
             }
 
-            const float * VS_RESTRICT src_patchp = srcp + bm_y * stride + bm_x;
+            errors.emplace_back(std::make_tuple(error, bm_x, bm_y));
 
-            float * VS_RESTRICT mean_patchp {nullptr};
-            if constexpr (residual) {
-                mean_patchp = mean_patch;
+            neighbour_patch++;
+        }
+
+        neighbour_patch += stride - (right - left + 1);
+    }
+#endif // __AVX2__
+}
+
+static inline void compute_block_distances(
+    std::vector<std::tuple<float, int, int>> & errors,
+    const float * VS_RESTRICT current_patch,
+    const float * VS_RESTRICT srcp,
+    const std::vector<std::tuple<int, int>> & search_positions,
+    int stride,
+    int block_size
+) noexcept {
+
+#ifdef __AVX2__
+    if (block_size == 8) {
+        return compute_block_distances_avx2<BlockSizeInfo::Is8>(
+            errors,
+            current_patch, srcp, search_positions, stride, block_size
+        );
+    } else if ((block_size % 8) == 0) {
+        return compute_block_distances_avx2<BlockSizeInfo::Mod8>(
+            errors,
+            current_patch, srcp, search_positions, stride, block_size
+        );
+    } else {
+        return compute_block_distances_avx2<BlockSizeInfo::General>(
+            errors,
+            current_patch, srcp, search_positions, stride, block_size
+        );
+    }
+#else // __AVX2__
+    for (const auto & [bm_x, bm_y]: search_positions) {
+        float error = 0.f;
+
+        const float * VS_RESTRICT current_patchp = current_patch;
+        const float * VS_RESTRICT neighbour_patchp = &srcp[bm_y * stride + bm_x];
+
+        for (int patch_y = 0; patch_y < block_size; ++patch_y) {
+            for (int patch_x = 0; patch_x < block_size; ++patch_x) {
+                error += square(current_patchp[patch_x] - neighbour_patchp[patch_x]);
             }
 
-            for (int patch_y = 0; patch_y < block_size8; ++patch_y) {
+            current_patchp += block_size;
+            neighbour_patchp += stride;
+        }
+
+        errors.emplace_back(std::make_tuple(error, bm_x, bm_y));
+    }
+#endif // __AVX2__
+}
+
+#ifdef __AVX2__
+template <BlockSizeInfo dispatch, bool residual>
+static inline void load_patches_avx2(
+    float * VS_RESTRICT denoising_patch, int svd_lda,
+    std::conditional_t<residual, float * VS_RESTRICT, std::nullptr_t> mean_patch,
+    const std::vector<const float *> & srcps,
+    const std::vector<std::tuple<float, int, int, int>> & errors,
+    int width, int height, int stride,
+    int active_group_size,
+    int block_size
+) noexcept {
+
+    if constexpr (dispatch == BlockSizeInfo::Is8) {
+        block_size = 8;
+    }
+
+    [[maybe_unused]] std::conditional_t<dispatch == BlockSizeInfo::General, Vec8i, Empty> mask;
+    if constexpr (dispatch == BlockSizeInfo::General) {
+        mask = make_mask(block_size % 8);
+    }
+
+    assert(stride % 8 == 0);
+
+    for (int i = 0; i < active_group_size; ++i) {
+        auto [error, bm_x, bm_y, bm_t] = errors[i];
+
+        const float * VS_RESTRICT src_patchp = &srcps[bm_t][bm_y * stride + bm_x];
+
+        [[maybe_unused]] std::conditional_t<residual, float * VS_RESTRICT, std::nullptr_t> mean_patchp { mean_patch };
+
+        for (int patch_y = 0; patch_y < block_size; ++patch_y) {
+            if constexpr (dispatch == BlockSizeInfo::Is8) {
                 Vec8f vec_src = Vec8f().load(src_patchp);
-                vec_src.store_a(denoising_patchp);
+                vec_src.store_a(denoising_patch);
                 src_patchp += stride;
-                denoising_patchp += 8;
+                denoising_patch += 8;
 
                 if constexpr (residual) {
                     Vec8f vec_mean = Vec8f().load_a(mean_patchp);
@@ -366,29 +501,12 @@ static inline void bm_sorted(std::vector<std::tuple<float, int, int>> & errors, 
                     vec_mean.store_a(mean_patchp);
                     mean_patchp += 8;
                 }
-            }
-        }
-    } else if ((block_size & 7) == 0) { // block_size % 8 == 0
-        for (int i = 0; i < group_size; ++i) {
-            auto [error, bm_x, bm_y] = errors[i];
-
-            if constexpr (fast) {
-                denoised[bm_y * width + bm_x] = true;
-            }
-
-            const float * VS_RESTRICT src_patchp = srcp + bm_y * stride + bm_x;
-
-            float * VS_RESTRICT mean_patchp {nullptr};
-            if constexpr (residual) {
-                mean_patchp = mean_patch;
-            }
-
-            for (int patch_y = 0; patch_y < block_size; ++patch_y) {
+            } else if constexpr (dispatch == BlockSizeInfo::Mod8) {
                 for (int patch_x = 0; patch_x < block_size; patch_x += 8) {
                     Vec8f vec_src = Vec8f().load(src_patchp);
-                    vec_src.store_a(denoising_patchp);
+                    vec_src.store_a(denoising_patch);
                     src_patchp += 8;
-                    denoising_patchp += 8;
+                    denoising_patch += 8;
 
                     if constexpr (residual) {
                         Vec8f vec_mean = Vec8f().load_a(mean_patchp);
@@ -399,31 +517,12 @@ static inline void bm_sorted(std::vector<std::tuple<float, int, int>> & errors, 
                 }
 
                 src_patchp += stride - block_size;
-            }
-        }
-    } else { // block_size % 8 != 0
-        Vec8i mask { make_mask(block_size & 7) };
-
-        for (int i = 0; i < group_size; ++i) {
-            auto [error, bm_x, bm_y] = errors[i];
-
-            if constexpr (fast) {
-                denoised[bm_y * width + bm_x] = true;
-            }
-
-            const float * VS_RESTRICT src_patchp = srcp + bm_y * stride + bm_x;
-
-            float * VS_RESTRICT mean_patchp {nullptr};
-            if constexpr (residual) {
-                mean_patchp = mean_patch;
-            }
-
-            for (int patch_y = 0; patch_y < block_size; ++patch_y) {
+            } if constexpr (dispatch == BlockSizeInfo::General) {
                 for (int patch_x = 0; patch_x < (block_size & (-8)); patch_x += 8) {
                     Vec8f vec_src = Vec8f().load(src_patchp);
-                    vec_src.store(denoising_patchp);
+                    vec_src.store(denoising_patch);
                     src_patchp += 8;
-                    denoising_patchp += 8;
+                    denoising_patch += 8;
 
                     if constexpr (residual) {
                         Vec8f vec_mean = Vec8f().load(mean_patchp);
@@ -435,31 +534,65 @@ static inline void bm_sorted(std::vector<std::tuple<float, int, int>> & errors, 
 
                 {
                     Vec8f vec_src = _mm256_maskload_ps(src_patchp, mask);
-                    vec_src.store(denoising_patchp); // denoising_patch is padded
+                    vec_src.store(denoising_patch); // denoising_patch is padded
                     src_patchp += stride - (block_size & (-8));
-                    denoising_patchp += block_size & 7;
+                    denoising_patch += block_size % 8;
 
                     if constexpr (residual) {
                         Vec8f vec_mean = Vec8f().load(mean_patchp);
                         vec_mean += vec_src;
                         vec_mean.store(mean_patchp); // mean_patch is padded
-                        mean_patchp += block_size & 7;
+                        mean_patchp += block_size % 8;
                     }
                 }
             }
+        }
 
-            denoising_patchp += svd_lda - square(block_size);
+        if constexpr (dispatch == BlockSizeInfo::General) {
+            denoising_patch += svd_lda - square(block_size);
+        } else {
+            assert(svd_lda - square(block_size) == 0);
         }
     }
-#else
-    for (int i = 0, index = 0; i < group_size; ++i) {
-        auto [error, bm_x, bm_y] = errors[i];
+}
+#endif // __AVX2__
 
-        if constexpr (fast) {
-            denoised[bm_y * width + bm_x] = true;
-        }
+template <bool residual>
+static inline void load_patches(
+    float * VS_RESTRICT denoising_patch, int svd_lda,
+    std::conditional_t<residual, float * VS_RESTRICT, std::nullptr_t> mean_patch,
+    const std::vector<const float *> & srcps,
+    const std::vector<std::tuple<float, int, int, int>> & errors,
+    int width, int height, int stride,
+    int active_group_size,
+    int block_size
+) noexcept {
 
-        const float * VS_RESTRICT src_patchp = srcp + bm_y * stride + bm_x;
+#ifdef __AVX2__
+    if (block_size == 8) {
+        return load_patches_avx2<BlockSizeInfo::Is8, residual>(
+            denoising_patch, svd_lda, mean_patch,
+            srcps, errors, width, height, stride,
+            active_group_size, block_size
+        );
+    } else if ((block_size % 8) == 0) { // block_size % 8 == 0
+        return load_patches_avx2<BlockSizeInfo::Mod8, residual>(
+            denoising_patch, svd_lda, mean_patch,
+            srcps, errors, width, height, stride,
+            active_group_size, block_size
+        );
+    } else { // block_size % 8 != 0
+        return load_patches_avx2<BlockSizeInfo::General, residual>(
+            denoising_patch, svd_lda, mean_patch,
+            srcps, errors, width, height, stride,
+            active_group_size, block_size
+        );
+    }
+#else // __AVX2__
+    for (int i = 0, index = 0; i < active_group_size; ++i) {
+        auto [error, bm_x, bm_y, bm_t] = errors[i];
+
+        const float * VS_RESTRICT src_patchp = &srcps[bm_t][bm_y * stride + bm_x];
 
         float * VS_RESTRICT mean_patchp {nullptr};
         if constexpr (residual) {
@@ -470,7 +603,7 @@ static inline void bm_sorted(std::vector<std::tuple<float, int, int>> & errors, 
             for (int patch_x = 0; patch_x < block_size; ++patch_x) {
                 float src_val = src_patchp[patch_x];
 
-                denoising_patchp[patch_x] = src_val;
+                denoising_patch[patch_x] = src_val;
 
                 if constexpr (residual) {
                     mean_patchp[patch_x] += src_val;
@@ -478,71 +611,24 @@ static inline void bm_sorted(std::vector<std::tuple<float, int, int>> & errors, 
             }
 
             src_patchp += stride;
-            denoising_patchp += block_size;
+            denoising_patch += block_size;
         }
 
-        denoising_patchp += svd_lda - square(block_size);
+        denoising_patch += svd_lda - square(block_size);
     }
-#endif
-}
-
-template<bool residual, bool fast>
-static inline void bm_full(const float * VS_RESTRICT src,
-    int width, int x, int y, int top, int bottom, int left, int right, int block_size,
-    int stride, float * VS_RESTRICT denoising_patch, float * VS_RESTRICT mean_patch,
-    int svd_lda, bool * VS_RESTRICT denoised) noexcept {
-
-    src += top * stride;
-
-    if constexpr (fast) {
-        denoised += top * width;
-    }
-
-    for (int bm_y = top; bm_y <= bottom; ++bm_y) {
-        for (int bm_x = left; bm_x <= right; ++bm_x) {
-            if constexpr (fast) {
-                denoised[bm_x] = true;
-            }
-
-            const float * VS_RESTRICT srcp = src + bm_x;
-            float * VS_RESTRICT mean_patchp {mean_patch};
-
-            for (int patch_y = 0; patch_y < block_size; ++patch_y) {
-                for (int patch_x = 0; patch_x < block_size; ++patch_x) {
-                    float src_val = srcp[patch_x];
-
-                    denoising_patch[patch_x] = src_val;
-
-                    if constexpr (residual) {
-                        mean_patchp[patch_x] += src_val;
-                    }
-                }
-
-                srcp += stride;
-                denoising_patch += block_size;
-                mean_patchp += block_size;
-            }
-
-            denoising_patch += svd_lda - square(block_size);
-        }
-
-        src += stride;
-
-        if constexpr (fast) {
-            denoised += width;
-        }
-    }
+#endif // __AVX2__
 }
 
 static inline void bm_post(float * VS_RESTRICT mean_patch, float * VS_RESTRICT denoising_patch,
-    int block_size, int group_size, int num_neighbours, int svd_lda) noexcept {
+    int block_size, int active_group_size, int svd_lda) noexcept {
 
     // substract group mean
+
     for (int i = 0; i < square(block_size); ++i) {
-        mean_patch[i] /= VSMIN(num_neighbours, group_size);
+        mean_patch[i] /= active_group_size;
     }
 
-    for (int i = 0; i < VSMIN(num_neighbours, group_size); ++i) {
+    for (int i = 0; i < active_group_size; ++i) {
         for (int j = 0; j < square(block_size); ++j) {
             denoising_patch[j] -= mean_patch[j];
         }
@@ -551,34 +637,171 @@ static inline void bm_post(float * VS_RESTRICT mean_patch, float * VS_RESTRICT d
     }
 }
 
+static inline void extend_errors(
+    std::vector<std::tuple<float, int, int, int>> & errors,
+    const std::vector<std::tuple<float, int, int>> & spatial_errors,
+    int temporal_index
+) noexcept {
+
+    errors.reserve(std::size(errors) + std::size(spatial_errors));
+    for (const auto & [error, x, y] : spatial_errors) {
+        errors.emplace_back(std::make_tuple(error, x, y, temporal_index));
+    }
+}
+
 template<bool residual>
-static inline WnnmInfo patch_estimation(float * VS_RESTRICT wdst, float * VS_RESTRICT weight, float & adaptive_weight,
+static inline int block_matching(
+    float * VS_RESTRICT denoising_patch, int svd_lda,
+    std::vector<std::tuple<float, int, int, int>> & errors,
+    float * VS_RESTRICT current_patch,
+    std::conditional_t<residual, float * VS_RESTRICT, std::nullptr_t> mean_patch,
+    const std::vector<const float *> & srcps, // length: 2 * radius + 1
+    int width, int height, int stride,
+    int x, int y,
+    int block_size, int block_step, int group_size, int bm_range,
+    int ps_num, int ps_range
+) noexcept {
+
+    errors.clear();
+
+    auto radius = (static_cast<int>(std::size(srcps)) - 1) / 2;
+
+    vs_bitblt(
+        current_patch, block_size * sizeof(float),
+        &srcps[radius][y * stride + x], stride * sizeof(float),
+        block_size * sizeof(float), block_size
+    );
+
+    std::vector<std::tuple<float, int, int>> center_errors;
+
+    int top = std::max(y - bm_range, 0);
+    int bottom = std::min(y + bm_range, height - block_size);
+    int left = std::max(x - bm_range, 0);
+    int right = std::min(x + bm_range, width - block_size);
+
+    compute_block_distances(
+        center_errors,
+        current_patch,
+        &srcps[radius][top * stride + left],
+        top, bottom, left, right,
+        stride, block_size
+    );
+
+    if (radius == 0) {
+        extend_errors(errors, center_errors, radius);
+    } else {
+        int active_ps_num = std::min(ps_num, static_cast<int>(std::size(center_errors)));
+        std::partial_sort(
+            center_errors.begin(),
+            center_errors.begin() + active_ps_num,
+            center_errors.end(),
+            [](auto a, auto b) { return std::get<0>(a) < std::get<0>(b); }
+        );
+        extend_errors(errors, center_errors, radius);
+        center_errors.resize(active_ps_num);
+
+        for (int direction = -1; direction <= 1; direction += 2) {
+            auto temporal_errors = center_errors; // mutable
+
+            for (int i = 1; i <= radius; i++) {
+                auto temporal_index = radius + direction * i;
+
+                auto search_locations = generate_search_locations(
+                    std::data(temporal_errors), active_ps_num,
+                    block_size, width, height, ps_range
+                );
+
+                temporal_errors.clear();
+
+                compute_block_distances(
+                    temporal_errors,
+                    current_patch,
+                    srcps[temporal_index],
+                    search_locations,
+                    stride, block_size
+                );
+
+                std::partial_sort(
+                    temporal_errors.begin(),
+                    temporal_errors.begin() + std::min(ps_num, static_cast<int>(std::size(temporal_errors))),
+                    temporal_errors.end(),
+                    [](auto a, auto b) { return std::get<0>(a) < std::get<0>(b); }
+                );
+                extend_errors(errors, temporal_errors, temporal_index);
+            }
+        }
+    }
+
+    int active_group_size = std::min(group_size, static_cast<int>(std::size(errors)));
+    std::partial_sort(
+        errors.begin(),
+        errors.begin() + active_group_size,
+        errors.end(),
+        [](auto a, auto b) { return std::get<0>(a) < std::get<0>(b); }
+    );
+    errors.resize(active_group_size);
+    bool center = false;
+    for (int i = 0; i < active_group_size; i++) {
+        const auto & [_, bm_x, bm_y, bm_t] = errors[i];
+        if (bm_x == x && bm_y == y && bm_t == radius) {
+            center = true;
+        }
+    }
+    if (!center) {
+        errors.insert(std::begin(errors), std::make_tuple(0.0f, x, y, radius));
+    }
+
+    load_patches<residual>(
+        denoising_patch, svd_lda, mean_patch,
+        srcps, errors, width, height, stride, active_group_size, block_size);
+
+    if constexpr (residual) {
+        bm_post(mean_patch, denoising_patch, block_size, active_group_size, svd_lda);
+    }
+
+    return active_group_size;
+}
+
+template<bool residual>
+static inline WnnmInfo patch_estimation(
+    float * VS_RESTRICT denoising_patch, int svd_lda,
+    float & adaptive_weight,
     float sigma,
-    int block_size, int group_size, int num_neighbours, float * VS_RESTRICT denoising_patch,
-    float * VS_RESTRICT mean_patch, int svd_lda,
-    float * VS_RESTRICT svd_s, float * VS_RESTRICT svd_u, int svd_ldu,
-    float * VS_RESTRICT svd_vt, int svd_ldvt, float * VS_RESTRICT svd_work, int svd_lwork,
-    int * VS_RESTRICT svd_iwork, bool adaptive_aggregation) noexcept {
+    int block_size, int active_group_size,
+    float * VS_RESTRICT mean_patch,
+    bool adaptive_aggregation,
+    float * VS_RESTRICT svd_s,
+    float * VS_RESTRICT svd_u, int svd_ldu,
+    float * VS_RESTRICT svd_vt, int svd_ldvt,
+    float * VS_RESTRICT svd_work, int svd_lwork, int * VS_RESTRICT svd_iwork
+) noexcept {
 
     int m = square(block_size);
-    int n = VSMIN(num_neighbours, group_size);
+    int n = active_group_size;
 
     int svd_info;
-    sgesdd("S", &m, &n, denoising_patch, &svd_lda, svd_s, svd_u, &svd_ldu, svd_vt, &svd_ldvt, svd_work, &svd_lwork, svd_iwork, &svd_info);
+    sgesdd(
+        "S", &m, &n,
+        denoising_patch, &svd_lda,
+        svd_s,
+        svd_u, &svd_ldu,
+        svd_vt, &svd_ldvt,
+        svd_work, &svd_lwork, svd_iwork, &svd_info
+    );
 
     if (svd_info != 0) {
         return WnnmInfo::FAILURE;
     }
 
     // WNNP with parameter epsilon ignored
-    float constant = 8.f * sqrtf(2.0f * n) * square(sigma);
+    const float constant = 8.f * sqrtf(2.0f * n) * square(sigma);
 
     int k = 1;
     if constexpr (residual) {
         k = 0;
     }
 
-    for ( ; k < VSMIN(m, n); ++k) {
+    for ( ; k < std::min(m, n); ++k) {
         float s = svd_s[k];
         float tmp = square(s) - constant;
         if (tmp > 0.f) {
@@ -588,15 +811,8 @@ static inline WnnmInfo patch_estimation(float * VS_RESTRICT wdst, float * VS_RES
         }
     }
 
-    if constexpr (residual) {
-        if (k == 0) {
-            // simply copy the mean_patch
-            return WnnmInfo::EMPTY;
-        }
-    }
-
     if (adaptive_aggregation) {
-        adaptive_weight = 1.f / k;
+        adaptive_weight = (k > 0) ? (1.f / k) : 1.0f;
     }
 
     // gemm
@@ -625,7 +841,7 @@ static inline WnnmInfo patch_estimation(float * VS_RESTRICT wdst, float * VS_RES
     sgemm("N", "N", &m, &n, &k, &alpha, svd_u, &svd_ldu, svd_vt, &svd_ldvt, &beta, denoising_patch, &svd_lda);
 
     if constexpr (residual) {
-        for (int i = 0; i < VSMIN(num_neighbours, group_size); ++i) {
+        for (int i = 0; i < active_group_size; ++i) {
             for (int patch_i = 0; patch_i < square(block_size); ++patch_i) {
                 denoising_patch[patch_i] += mean_patch[patch_i];
             }
@@ -637,17 +853,50 @@ static inline WnnmInfo patch_estimation(float * VS_RESTRICT wdst, float * VS_RES
     return WnnmInfo::SUCCESS;
 }
 
-static void patch_estimation_skip1_sorted(float * VS_RESTRICT wdst, float * VS_RESTRICT weight,
-    const float * VS_RESTRICT src,
-    const std::vector<std::tuple<float, int, int>> & errors, int width,
-    int stride, int block_size, int group_size) noexcept {
+static inline void col2im(
+    float * VS_RESTRICT intermediate,
+    const float * VS_RESTRICT denoising_patch, int svd_lda,
+    const std::vector<std::tuple<float, int, int, int>> & errors,
+    int width, int height, int intermediate_stride,
+    int block_size, int active_group_size,
+    float adaptive_weight
+) noexcept {
 
-    for (int i = 0; i < group_size; ++i) {
-        auto [error, bm_x, bm_y] = errors[i];
+    for (int i = 0; i < active_group_size; ++i) {
+        auto [error, bm_x, bm_y, bm_t] = errors[i];
 
-        const float * VS_RESTRICT srcp = src + bm_y * stride + bm_x;
-        float * VS_RESTRICT wdstp = wdst + bm_y * width + bm_x;
-        float * VS_RESTRICT weightp = weight + bm_y * width + bm_x;
+        float * VS_RESTRICT wdstp = &intermediate[(bm_t * 2 * height + bm_y) * intermediate_stride + bm_x];
+        float * VS_RESTRICT weightp = &intermediate[((bm_t * 2 + 1) * height + bm_y) * intermediate_stride + bm_x];
+
+        for (int patch_y = 0; patch_y < block_size; ++patch_y) {
+            for (int patch_x = 0; patch_x < block_size; ++patch_x) {
+                wdstp[patch_x] += denoising_patch[patch_x] * adaptive_weight;
+                weightp[patch_x] += adaptive_weight;
+            }
+
+            wdstp += intermediate_stride;
+            weightp += intermediate_stride;
+            denoising_patch += block_size;
+        }
+
+        denoising_patch += svd_lda - square(block_size);
+    }
+}
+
+static void patch_estimation_skip(
+    float * VS_RESTRICT intermediate,
+    const std::vector<const float *> & srcps,
+    const std::vector<std::tuple<float, int, int, int>> & errors,
+    int width, int height, int stride, int intermediate_stride,
+    int block_size, int active_group_size
+) noexcept {
+
+    for (int i = 0; i < active_group_size; ++i) {
+        auto [error, bm_x, bm_y, bm_t] = errors[i];
+
+        const float * VS_RESTRICT srcp = &srcps[bm_t][bm_y * stride + bm_x];
+        float * VS_RESTRICT wdstp = &intermediate[(bm_t * 2 * height + bm_y) * intermediate_stride + bm_x];
+        float * VS_RESTRICT weightp = &intermediate[((bm_t * 2 + 1) * height + bm_y) * intermediate_stride + bm_x];
 
         for (int patch_y = 0; patch_y < block_size; ++patch_y) {
             for (int patch_x = 0; patch_x < block_size; ++patch_x) {
@@ -656,182 +905,35 @@ static void patch_estimation_skip1_sorted(float * VS_RESTRICT wdst, float * VS_R
             }
 
             srcp += stride;
-            wdstp += width;
-            weightp += width;
+            wdstp += intermediate_stride;
+            weightp += intermediate_stride;
         }
     }
 }
 
-static void patch_estimation_skip1_full(float * VS_RESTRICT wdst, float * VS_RESTRICT weight,
-    const float * VS_RESTRICT src,
-    int left, int right, int top, int bottom, int width, int stride,
-    int block_size) noexcept {
+static inline void aggregation(
+    float * VS_RESTRICT dstp,
+    const float * VS_RESTRICT intermediate,
+    int width, int height, int stride
+) noexcept {
 
-    src += top * stride;
-    wdst += top * width;
-    weight += top * width;
-
-    for (int bm_y = top; bm_y <= bottom; ++bm_y) {
-        for (int bm_x = left; bm_x <= right; ++bm_x) {
-            const float * VS_RESTRICT srcp = src + bm_x;
-            float * VS_RESTRICT wdstp = wdst + bm_x;
-            float * VS_RESTRICT weightp = weight + bm_x;
-
-            for (int patch_y = 0; patch_y < block_size; ++patch_y) {
-                for (int patch_x = 0; patch_x < block_size; ++patch_x) {
-                    wdstp[patch_x] += srcp[patch_x];
-                    weightp[patch_x] += 1.f;
-                }
-
-                srcp += stride;
-                wdstp += width;
-                weightp += width;
-            }
-        }
-
-        src += stride;
-        wdst += width;
-        weight += width;
-    }
-}
-
-static inline void patch_estimation_skip2_sorted(float * VS_RESTRICT wdst, float * VS_RESTRICT weight,
-    const std::vector<std::tuple<float, int, int>> & errors, int width,
-    int block_size, int group_size, const float * VS_RESTRICT mean_patch) noexcept {
-
-    for (int i = 0; i < group_size; ++i) {
-        auto [error, bm_x, bm_y] = errors[i];
-
-        const float * VS_RESTRICT mean_patchp {mean_patch};
-        float * VS_RESTRICT wdstp = wdst + bm_y * width + bm_x;
-        float * VS_RESTRICT weightp = weight + bm_y * width + bm_x;
-
-        for (int patch_y = 0; patch_y < block_size; ++patch_y) {
-            for (int patch_x = 0; patch_x < block_size; ++patch_x) {
-                wdstp[patch_x] += mean_patchp[patch_x];
-                weightp[patch_x] += 1.f;
-            }
-
-            mean_patchp += block_size;
-            wdstp += width;
-            weightp += width;
-        }
-    }
-}
-
-static inline void patch_estimation_skip2_full(float * VS_RESTRICT wdst, float * VS_RESTRICT weight,
-    int left, int right, int top, int bottom, int width,
-    int block_size, const float * VS_RESTRICT mean_patch) noexcept {
-
-    wdst += top * width;
-    weight += top * width;
-
-    for (int bm_y = top; bm_y <= bottom; ++bm_y) {
-        for (int bm_x = left; bm_x <= right; ++bm_x) {
-            const float * VS_RESTRICT mean_patchp {mean_patch};
-            float * VS_RESTRICT wdstp = wdst + bm_x;
-            float * VS_RESTRICT weightp = weight + bm_x;
-
-            for (int patch_y = 0; patch_y < block_size; ++patch_y) {
-                for (int patch_x = 0; patch_x < block_size; ++patch_x) {
-                    wdstp[patch_x] += mean_patchp[patch_x];
-                    weightp[patch_x] += 1.f;
-                }
-
-                mean_patchp += block_size;
-                wdstp += width;
-                weightp += width;
-            }
-        }
-
-        wdst += width;
-        weight += width;
-    }
-}
-
-static inline void col2im_sorted(float * VS_RESTRICT wdst, float * VS_RESTRICT weight,
-    const std::vector<std::tuple<float, int, int>> & errors, int width,
-    int block_size, int group_size, const float * VS_RESTRICT denoising_patch,
-    int svd_lda, float adaptive_weight) noexcept {
-
-    for (int i = 0; i < group_size; ++i) {
-        auto [error, bm_x, bm_y] = errors[i];
-
-        float * VS_RESTRICT wdstp = wdst + bm_y * width + bm_x;
-        float * VS_RESTRICT weightp = weight + bm_y * width + bm_x;
-
-        for (int patch_y = 0; patch_y < block_size; ++patch_y) {
-            for (int patch_x = 0; patch_x < block_size; ++patch_x) {
-                wdstp[patch_x] += denoising_patch[patch_x] * adaptive_weight;
-                weightp[patch_x] += adaptive_weight;
-            }
-
-            wdstp += width;
-            weightp += width;
-            denoising_patch += block_size;
-        }
-
-        denoising_patch += svd_lda - square(block_size);
-    }
-}
-
-static inline void col2im_full(float * VS_RESTRICT wdst, float * VS_RESTRICT weight,
-    int top, int bottom, int left, int right, int width,
-    int block_size, const float * VS_RESTRICT denoising_patch,
-    int svd_lda, float adaptive_weight) noexcept {
-
-    wdst += top * width;
-    weight += top * width;
-
-    for (int bm_y = top; bm_y <= bottom; ++bm_y) {
-        for (int bm_x = left; bm_x <= right; ++bm_x) {
-            float * VS_RESTRICT wdstp = wdst + bm_x;
-            float * VS_RESTRICT weightp = weight + bm_x;
-
-            for (int patch_y = 0; patch_y < block_size; ++patch_y) {
-                for (int patch_x = 0; patch_x < block_size; ++patch_x) {
-                    wdstp[patch_x] += denoising_patch[patch_x] * adaptive_weight;
-                    weightp[patch_x] += adaptive_weight;
-                }
-
-                wdstp += width;
-                weightp += width;
-                denoising_patch += block_size;
-            }
-
-            denoising_patch += svd_lda - square(block_size);
-        }
-
-        wdst += width;
-        weight += width;
-    }
-}
-
-static inline void aggregation(float * VS_RESTRICT dstp, const float * VS_RESTRICT srcp,
-    int width, int height, int stride, const float * VS_RESTRICT wdst,
-    const float * VS_RESTRICT weight) noexcept {
-
-#ifdef __AVX2__
-    const Vec8f vec_eps { FLT_EPSILON };
-#endif
+    const float * VS_RESTRICT wdst = intermediate;
+    const float * VS_RESTRICT weight = &intermediate[height * width];
 
     for (int y = 0; y < height; ++y) {
         int x = 0;
 
 #ifdef __AVX2__
-        const float * VS_RESTRICT vec_srcp {srcp};
-        const float * VS_RESTRICT vec_wdstp {wdst};
-        const float * VS_RESTRICT vec_weightp {weight};
+        const float * VS_RESTRICT vec_wdstp { wdst };
+        const float * VS_RESTRICT vec_weightp { weight };
         float * VS_RESTRICT vec_dstp {dstp};
 
         for ( ; x < (width & (-8)); x += 8) {
-            Vec8f vec_src = Vec8f().load_a(vec_srcp);
             Vec8f vec_wdst = Vec8f().load(vec_wdstp);
             Vec8f vec_weight = Vec8f().load(vec_weightp);
-            Vec8f vec_dst = mul_add(vec_src, vec_eps, vec_wdst) * approx_recipr(vec_weight + vec_eps);
+            Vec8f vec_dst = vec_wdst * approx_recipr(vec_weight);
             vec_dst.store_a(vec_dstp);
 
-            vec_srcp += 8;
             vec_wdstp += 8;
             vec_weightp += 8;
             vec_dstp += 8;
@@ -839,18 +941,23 @@ static inline void aggregation(float * VS_RESTRICT dstp, const float * VS_RESTRI
 #endif
 
         for ( ; x < width; ++x) {
-            dstp[x] = (wdst[x] + srcp[x] * FLT_EPSILON) / (weight[x] + FLT_EPSILON);
+            dstp[x] = wdst[x] / weight[x];
         }
 
-        srcp += stride;
         dstp += stride;
         wdst += width;
         weight += width;
     }
 }
 
-template<bool residual, bool fast>
-static void process(const VSFrameRef * src, VSFrameRef * dst, WNNMData * d, const VSAPI * vsapi) noexcept {
+template<bool residual>
+static void process(
+    const std::vector<const VSFrameRef *> & srcs,
+    VSFrameRef * dst,
+    WNNMData * d,
+    const VSAPI * vsapi
+) noexcept {
+
     const auto threadId = std::this_thread::get_id();
 
 #ifdef __AVX2__
@@ -872,10 +979,13 @@ static void process(const VSFrameRef * src, VSFrameRef * dst, WNNMData * d, cons
 
     d->workspaces_lock.unlock_shared();
 
+    auto vi = vsapi->getVideoInfo(d->node);
+
     if (!init) {
         workspace.init(
-            d->vi->width, d->vi->height,
-            d->block_size, d->group_size, d->bm_range, d->residual, d->fast,
+            vi->width, vi->height,
+            d->block_size, d->group_size, d->bm_range, d->radius,
+            d->residual,
             d->svd_lda, d->svd_ldu, d->svd_ldvt, d->svd_lwork
         );
 
@@ -884,151 +994,122 @@ static void process(const VSFrameRef * src, VSFrameRef * dst, WNNMData * d, cons
         d->workspaces_lock.unlock();
     }
 
-    float * const VS_RESTRICT wdst = workspace.wdst;
-    float * const VS_RESTRICT weight = workspace.weight;
-    float * const VS_RESTRICT denoising_patch = workspace.denoising_patch;
-
-    float * VS_RESTRICT mean_patch {nullptr};
+    std::conditional_t<residual, float * VS_RESTRICT, std::nullptr_t> mean_patch;
     if constexpr (residual) {
-         mean_patch = workspace.mean_patch;
+        mean_patch = workspace.mean_patch;
     }
 
-    float * VS_RESTRICT current_patch = workspace.current_patch;
+    std::vector<std::tuple<float, int, int, int>> errors;
 
-    bool * VS_RESTRICT denoised {nullptr};
-    if constexpr (fast) {
-        denoised = workspace.denoised;
-    }
+    for (int plane = 0; plane < vi->format->numPlanes; plane++) {
+        if (!d->process[plane]) {
+            continue;
+        }
 
-    float * const VS_RESTRICT svd_s = workspace.svd_s;
-    float * const VS_RESTRICT svd_u = workspace.svd_u;
-    float * const VS_RESTRICT svd_vt = workspace.svd_vt;
-    float * const VS_RESTRICT svd_work = workspace.svd_work;
-    int * const VS_RESTRICT svd_iwork = workspace.svd_iwork;
-    const int svd_lwork = d->svd_lwork;
-    const int block_size = d->block_size;
-    const int block_step = d->block_step;
-    const int group_size = d->group_size;
-    const int bm_range = d->bm_range;
-    const int svd_lda = d->svd_lda;
-    const int svd_ldu = d->svd_ldu;
-    const int svd_ldvt = d->svd_ldvt;
-    const bool adaptive_aggregation = d->adaptive_aggregation;
+        const int width = vsapi->getFrameWidth(srcs[0], plane);
+        const int height = vsapi->getFrameHeight(srcs[0], plane);
+        const int stride = vsapi->getStride(srcs[0], plane) / static_cast<int>(sizeof(float));
+        std::vector<const float *> srcps;
+        srcps.reserve(std::size(srcs));
+        for (const auto & src : srcs) {
+            srcps.emplace_back(reinterpret_cast<const float *>(vsapi->getReadPtr(src, plane)));
+        }
+        float * const VS_RESTRICT dstp = reinterpret_cast<float *>(vsapi->getWritePtr(dst, plane));
 
-    std::vector<std::tuple<float, int, int>> errors;
-    if (d->group_size < square(2 * d->bm_range + 1)) {
-        errors.reserve(square(2 * d->bm_range + 1));
-    }
+        if (d->radius == 0) {
+            std::memset(workspace.intermediate, 0, height * width * sizeof(float));
+        } else {
+            std::memset(dstp, 0, 2 * (2 * d->radius + 1) * height * stride * sizeof(float));
+        }
 
-    for (int plane = 0; plane < d->vi->format->numPlanes; plane++) {
-        if (d->process[plane]) {
-            const int width = vsapi->getFrameWidth(src, plane);
-            const int height = vsapi->getFrameHeight(src, plane);
-            const int stride = vsapi->getStride(src, plane) / sizeof(float);
-            const float * const srcp = reinterpret_cast<const float *>(vsapi->getReadPtr(src, plane));
-            float * const VS_RESTRICT dstp = reinterpret_cast<float *>(vsapi->getWritePtr(dst, plane));
+        int temp_r = height - d->block_size;
+        int temp_c = width - d->block_size;
 
-            memset(wdst, 0, sizeof(float) * height * width);
-            memset(weight, 0, sizeof(float) * height * width);
+        for (int _y = 0; _y < temp_r + d->block_step; _y += d->block_step) {
+            int y = std::min(_y, temp_r); // clamp
 
-            if constexpr (fast) {
-                memset(denoised, 0, sizeof(bool) * height * width);
-            }
+            for (int _x = 0; _x < temp_c + d->block_step; _x += d->block_step) {
+                int x = std::min(_x, temp_c); // clamp
 
-            int temp_r = height - block_size;
-            int temp_c = width - block_size;
-
-            for (int y = 0;; y += block_step) {
-                if (y >= temp_r + block_step) {
-                    break;
-                } else if (y > temp_r) {
-                    y = temp_r;
+                if constexpr (residual) {
+                    std::memset(mean_patch, 0, sizeof(float) * square(d->block_size));
                 }
 
-                const int top = VSMAX(y - bm_range, 0);
-                const int bottom = VSMIN(y + bm_range, temp_r);
+                int active_group_size = block_matching<residual>(
+                    // outputs
+                    workspace.denoising_patch, d->svd_lda,
+                    errors,
+                    workspace.current_patch, mean_patch,
+                    // inputs
+                    srcps, width, height, stride,
+                    x, y,
+                    d->block_size, d->block_step, d->group_size, d->bm_range,
+                    d->ps_num, d->ps_range
+                );
 
-                for (int x = 0;; x += block_step) {
-                    if (x >= temp_c + block_step) {
+                // patch_estimation with early skipping on SVD exception
+                float adaptive_weight = 1.f;
+                WnnmInfo info = patch_estimation<residual>(
+                    // outputs
+                    workspace.denoising_patch, d->svd_lda,
+                    adaptive_weight,
+                    // inputs
+                    d->sigma[plane],
+                    d->block_size, active_group_size, mean_patch, d->adaptive_aggregation,
+                    // temporaries
+                    workspace.svd_s, workspace.svd_u, d->svd_ldu, workspace.svd_vt, d->svd_ldvt,
+                    workspace.svd_work, d->svd_lwork, workspace.svd_iwork
+                );
+
+                switch (info) {
+                    case WnnmInfo::SUCCESS: {
+                        if (d->radius == 0) {
+                            col2im(
+                                // output
+                                workspace.intermediate,
+                                // inputs
+                                workspace.denoising_patch, d->svd_lda,
+                                errors, width, height, width,
+                                d->block_size, active_group_size, adaptive_weight
+                            );
+                        } else {
+                            col2im(
+                                // output
+                                dstp,
+                                // inputs
+                                workspace.denoising_patch, d->svd_lda,
+                                errors, width, height, stride,
+                                d->block_size, active_group_size, adaptive_weight
+                            );
+                        }
                         break;
-                    } else if (x > temp_c) {
-                        x = temp_c;
                     }
-
-                    if constexpr (fast) {
-                        if (denoised[y * width + x]) {
-                            continue;
+                    case WnnmInfo::FAILURE: {
+                        if (d->radius == 0) {
+                            patch_estimation_skip(
+                                // output
+                                workspace.intermediate, srcps,
+                                errors, width, height, stride, width,
+                                d->block_size, active_group_size
+                            );
+                        } else {
+                            patch_estimation_skip(
+                                // output
+                                dstp,
+                                // inputs
+                                srcps,
+                                errors, width, height, stride, stride,
+                                d->block_size, active_group_size
+                            );
                         }
-                    }
-
-                    if constexpr (residual) {
-                        memset(mean_patch, 0, sizeof(float) * square(block_size));
-                    }
-
-                    const int left = VSMAX(x - bm_range, 0);
-                    const int right = VSMIN(x + bm_range, temp_c);
-
-                    int num_neighbours = (bottom - top + 1) * (right - left + 1);
-
-                    if (num_neighbours > group_size) {
-                        bm_sorted<residual, fast>(errors, srcp, width, x, y, top, bottom, left, right,
-                            block_size, group_size, stride, denoising_patch, mean_patch, current_patch,
-                            svd_lda, denoised);
-                    } else {
-                        bm_full<residual, fast>(srcp, width, x, y, top, bottom, left, right,
-                            block_size, stride, denoising_patch, mean_patch, svd_lda, denoised);
-                    }
-
-                    // substract group mean
-                    if constexpr (residual) {
-                        bm_post(mean_patch, denoising_patch, block_size, group_size, num_neighbours, svd_lda);
-                    }
-
-                    // patch_estimation with early skipping on SVD exception
-                    float adaptive_weight = 1.f;
-                    WnnmInfo info = patch_estimation<residual>(wdst, weight, adaptive_weight, d->sigma[plane],
-                        block_size, group_size, num_neighbours, denoising_patch, mean_patch, svd_lda,
-                        svd_s, svd_u, svd_ldu, svd_vt, svd_ldvt, svd_work, svd_lwork, svd_iwork,
-                        adaptive_aggregation);
-
-                    switch (info) {
-                        case WnnmInfo::SUCCESS: {
-                            if (num_neighbours > group_size) {
-                                col2im_sorted(wdst, weight, errors, width,
-                                    block_size, group_size, denoising_patch, svd_lda, adaptive_weight);
-                            } else {
-                                col2im_full(wdst, weight, top, bottom, left, right, width,
-                                    block_size, denoising_patch, svd_lda, adaptive_weight);
-                            }
-                            break;
-                        }
-
-                        case WnnmInfo::FAILURE: {
-                            if (num_neighbours > group_size) {
-                                patch_estimation_skip1_sorted(wdst, weight, srcp,
-                                    errors, width, stride, block_size, group_size);
-                            } else {
-                                patch_estimation_skip1_full(wdst, weight, srcp,
-                                    left, right, top, bottom, width, stride, block_size);
-                            }
-                            break;
-                        }
-
-                        case WnnmInfo::EMPTY: {
-                            if (num_neighbours > group_size) {
-                                patch_estimation_skip2_sorted(wdst, weight,
-                                    errors, width, block_size, group_size, mean_patch);
-                            } else {
-                                patch_estimation_skip2_full(wdst, weight,
-                                    left, right, top, bottom, width, block_size, mean_patch);
-                            }
-                            break;
-                        }
+                        break;
                     }
                 }
             }
+        }
 
-            aggregation(dstp, srcp, width, height, stride, wdst, weight);
+        if (d->radius == 0) {
+            aggregation(dstp, workspace.intermediate, width, height, stride);
         }
     }
 
@@ -1037,45 +1118,88 @@ static void process(const VSFrameRef * src, VSFrameRef * dst, WNNMData * d, cons
 #endif
 }
 
-static void VS_CC WNNMInit(VSMap *in, VSMap *out, void **instanceData, VSNode *node, VSCore *core, const VSAPI *vsapi) {
+static void VS_CC WNNMRawInit(
+    VSMap *in, VSMap *out, void **instanceData, VSNode *node,
+    VSCore *core, const VSAPI *vsapi
+) noexcept {
+
     WNNMData * d = static_cast<WNNMData *>(*instanceData);
-    vsapi->setVideoInfo(d->vi, 1, node);
+
+    if (d->radius > 0) {
+        auto vi = *vsapi->getVideoInfo(d->node);
+        vi.height *= 2 * (2 * d->radius + 1);
+        vsapi->setVideoInfo(&vi, 1, node);
+    } else {
+        auto vi = vsapi->getVideoInfo(d->node);
+        vsapi->setVideoInfo(vi, 1, node);
+    }
 }
 
-static const VSFrameRef *VS_CC WNNMGetFrame(int n, int activationReason, void **instanceData, void **frameData, VSFrameContext *frameCtx, VSCore *core, const VSAPI *vsapi) {
-    WNNMData * d = static_cast<WNNMData *>(*instanceData);
+static const VSFrameRef *VS_CC WNNMRawGetFrame(
+    int n, int activationReason, void **instanceData, void **frameData,
+    VSFrameContext *frameCtx, VSCore *core, const VSAPI *vsapi
+) noexcept {
+
+    auto * d = static_cast<WNNMData *>(*instanceData);
 
     if (activationReason == arInitial) {
-        vsapi->requestFrameFilter(n, d->node, frameCtx);
-    } else if (activationReason == arAllFramesReady) {
-        const VSFrameRef * src = vsapi->getFrameFilter(n, d->node, frameCtx);
-        const VSFrameRef * fr[] = { d->process[0] ? nullptr : src, d->process[1] ? nullptr : src, d->process[2] ? nullptr : src };
-        const int pl[] = { 0, 1, 2 };
-        VSFrameRef * dst = vsapi->newVideoFrame2(d->vi->format, d->vi->width, d->vi->height, fr, pl, src, core);
+        auto vi = vsapi->getVideoInfo(d->node);
 
-        if (d->residual) {
-            if (d->fast) {
-                process<true, true>(src, dst, d, vsapi);
-            } else {
-                process<true, false>(src, dst, d, vsapi);
-            }
-        } else {
-            if (d->fast) {
-                process<false, true>(src, dst, d, vsapi);
-            } else {
-                process<false, false>(src, dst, d, vsapi);
-            }
+        int start_frame = std::max(n - d->radius, 0);
+        int end_frame = std::min(n + d->radius, vi->numFrames - 1);
+
+        for (int i = start_frame; i <= end_frame; ++i) {
+            vsapi->requestFrameFilter(i, d->node, frameCtx);
+        }
+    } else if (activationReason == arAllFramesReady) {
+        auto vi = vsapi->getVideoInfo(d->node);
+
+        std::vector<const VSFrameRef *> srcs;
+        srcs.reserve(2 * d->radius + 1);
+        for (int i = -d->radius; i <= d->radius; i++) {
+            auto frame_id = std::clamp(n + i, 0, vi->numFrames - 1);
+            srcs.emplace_back(vsapi->getFrameFilter(frame_id, d->node, frameCtx));
         }
 
-        vsapi->freeFrame(src);
+        const auto & center_src = srcs[d->radius];
+        const VSFrameRef * fr[] {
+            d->process[0] ? nullptr : center_src,
+            d->process[1] ? nullptr : center_src,
+            d->process[2] ? nullptr : center_src
+        };
+        const int pl[] { 0, 1, 2 };
+        VSFrameRef * dst;
+        if (d->radius == 0) {
+            dst = vsapi->newVideoFrame2(vi->format, vi->width, vi->height, fr, pl, center_src, core);
+        } else {
+            dst = vsapi->newVideoFrame2(
+                vi->format,
+                vi->width, 2 * (2 * d->radius + 1) * vi->height,
+                fr, pl, center_src, core
+            );
+        }
+
+        if (d->residual) {
+            process<true>(srcs, dst, d, vsapi);
+        } else {
+            process<false>(srcs, dst, d, vsapi);
+        }
+
+        for (const auto & src : srcs) {
+            vsapi->freeFrame(src);
+        }
+
         return dst;
     }
 
     return nullptr;
 }
 
-static void VS_CC WNNMFree(void *instanceData, VSCore *core, const VSAPI *vsapi) {
-    WNNMData * d = static_cast<WNNMData *>(instanceData);
+static void VS_CC WNNMRawFree(
+    void *instanceData, VSCore *core, const VSAPI *vsapi
+) noexcept {
+
+    auto d = static_cast<WNNMData *>(instanceData);
 
     vsapi->freeNode(d->node);
 
@@ -1086,11 +1210,14 @@ static void VS_CC WNNMFree(void *instanceData, VSCore *core, const VSAPI *vsapi)
     delete d;
 }
 
-static void VS_CC WNNMCreate(const VSMap *in, VSMap *out, void *userData, VSCore *core, const VSAPI *vsapi) {
-    std::unique_ptr<WNNMData> d{ new WNNMData{} };
+static void VS_CC WNNMRawCreate(
+    const VSMap *in, VSMap *out, void *userData,
+    VSCore *core, const VSAPI *vsapi
+) noexcept {
+
+    auto d = std::make_unique<WNNMData>();
 
     d->node = vsapi->propGetNode(in, "clip", 0, nullptr);
-    d->vi = vsapi->getVideoInfo(d->node);
 
     auto set_error = [&](const std::string & error) -> void {
         vsapi->setError(out, ("WNNM: " + error).c_str());
@@ -1098,42 +1225,28 @@ static void VS_CC WNNMCreate(const VSMap *in, VSMap *out, void *userData, VSCore
         return ;
     };
 
-    if (!isConstantFormat(d->vi) || d->vi->format->sampleType == stInteger ||
-        (d->vi->format->sampleType == stFloat && d->vi->format->bitsPerSample != 32)
+    auto vi = vsapi->getVideoInfo(d->node);
+
+    if (!isConstantFormat(vi) || vi->format->sampleType == stInteger ||
+        (vi->format->sampleType == stFloat && vi->format->bitsPerSample != 32)
     ) {
         return set_error("only constant format 32 bit float input supported");
     }
 
     int error;
 
-    int m = vsapi->propNumElements(in, "sigma");
-
-    if (m > 0) {
-        int i;
-
-        if (m > 3) {
-            m = 3;
+    for (unsigned i = 0; i < std::size(d->sigma); i++) {
+        d->sigma[i] = static_cast<float>(vsapi->propGetFloat(in, "sigma", i, &error));
+        if (error) {
+            d->sigma[i] = (i == 0) ? 3.0f : d->sigma[i - 1];
         }
-
-        for (i = 0; i < m; ++i) {
-            d->sigma[i] = static_cast<float>(vsapi->propGetFloat(in, "sigma", i, nullptr));
-
-            if (d->sigma[i] < 0) {
-                return set_error("\"sigma\" must be positive");
-            }
-        }
-
-        for (; i < 3; ++i) {
-            d->sigma[i] = d->sigma[i - 1];
-        }
-    } else {
-        for (int i = 0; i < 3; ++i) {
-            d->sigma[i] = 3.0f;
+        if (d->sigma[i] < 0.0f) {
+            return set_error("\"sigma\" must be positive");
         }
     }
 
-    for (int i = 0; i < 3; ++i) {
-        if (d->sigma[i] == 0.f) {
+    for (unsigned i = 0; i < std::size(d->sigma); ++i) {
+        if (d->sigma[i] < std::numeric_limits<float>::epsilon()) {
             d->process[i] = false;
         } else {
             d->process[i] = true;
@@ -1171,9 +1284,30 @@ static void VS_CC WNNMCreate(const VSMap *in, VSMap *out, void *userData, VSCore
         return set_error("\"bm_range\" must be non-negative");
     }
 
+    d->radius = int64ToIntS(vsapi->propGetInt(in, "radius", 0, &error));
+    if (error) {
+        d->radius = 0;
+    } else if (d->radius < 0) {
+        return set_error("\"radius\" must be non-negative");
+    }
+
+    d->ps_num = int64ToIntS(vsapi->propGetInt(in, "ps_num", 0, &error));
+    if (error) {
+        d->ps_num = 2;
+    } else if (d->ps_num <= 0) {
+        return set_error("\"ps_num\" must be positive");
+    }
+
+    d->ps_range = int64ToIntS(vsapi->propGetInt(in, "ps_range", 0, &error));
+    if (error) {
+        d->ps_range = 4;
+    } else if (d->ps_range < 0) {
+        return set_error("\"ps_range\" must be non-negative");
+    }
+
     d->svd_lda = m16(square(d->block_size));
     d->svd_ldu = m16(square(d->block_size));
-    d->svd_ldvt = m16(VSMIN(square(d->block_size), VSMIN(d->group_size, square(2 * d->bm_range + 1))));
+    d->svd_ldvt = m16(std::min(square(d->block_size), d->group_size));
 
     d->residual = !!vsapi->propGetInt(in, "residual", 0, &error);
     if (error) {
@@ -1185,63 +1319,319 @@ static void VS_CC WNNMCreate(const VSMap *in, VSMap *out, void *userData, VSCore
         d->adaptive_aggregation = true;
     }
 
-    d->fast = !!vsapi->propGetInt(in, "fast", 0, &error);
-    if (error) {
-        d->fast = false;
-    }
-    d->fast = d->fast && (d->bm_range >= d->block_step);
-
     VSCoreInfo core_info;
     vsapi->getCoreInfo2(core, &core_info);
     auto numThreads = core_info.numThreads;
-
     d->workspaces.reserve(numThreads);
 
     int svd_m = square(d->block_size);
-    int svd_n = VSMIN(d->group_size, square(2 * d->bm_range + 1));
-    // d->svd_lwork = VSMIN(svd_m, svd_n) * (6 + 4 * VSMIN(svd_m, svd_n)) + VSMAX(svd_m, svd_n);
-    // query
-    float svd_work;
-    constexpr int svd_lwork = -1;
-    int info;
-    sgesdd(
-        "S", &svd_m, &svd_n,
-        nullptr, &d->svd_lda, nullptr, nullptr, &d->svd_ldu, nullptr, &d->svd_ldvt,
-        &svd_work, &svd_lwork,
-        nullptr, &info
-    );
-    if (info != 0) {
-        return set_error("sgesdd() workspace query failed");
-    }
-    d->svd_lwork = static_cast<int>(svd_work);
+    int svd_n = d->group_size;
+    d->svd_lwork = std::min(svd_m, svd_n) * (6 + 4 * std::min(svd_m, svd_n)) + std::max(svd_m, svd_n);
 
-    vsapi->createFilter(in, out, "WNNM", WNNMInit, WNNMGetFrame, WNNMFree, fmParallel, 0, d.release(), core);
+    vsapi->createFilter(in, out, "WNNMRaw", WNNMRawInit, WNNMRawGetFrame, WNNMRawFree, fmParallel, 0, d.release(), core);
 }
 
-VS_EXTERNAL_API(void) VapourSynthPluginInit(VSConfigPlugin configFunc, VSRegisterFunction registerFunc, VSPlugin *plugin) {
+struct VAggregateData {
+    VSNodeRef * node;
+
+    VSNodeRef * src_node;
+    const VSVideoInfo * src_vi;
+
+    std::array<bool, 3> process; // sigma != 0
+
+    int radius;
+
+    std::unordered_map<std::thread::id, float *> buffer;
+    std::shared_mutex buffer_lock;
+};
+
+static void VS_CC VAggregateInit(
+    VSMap *in, VSMap *out, void **instanceData, VSNode *node,
+    VSCore *core, const VSAPI *vsapi
+) noexcept {
+
+    auto * d = static_cast<VAggregateData *>(*instanceData);
+
+    vsapi->setVideoInfo(d->src_vi, 1, node);
+}
+
+static const VSFrameRef *VS_CC VAggregateGetFrame(
+    int n, int activationReason, void **instanceData, void **frameData,
+    VSFrameContext *frameCtx, VSCore *core, const VSAPI *vsapi
+) noexcept {
+
+    auto * d = static_cast<VAggregateData *>(*instanceData);
+
+    if (activationReason == arInitial) {
+        int start_frame = std::max(n - d->radius, 0);
+        int end_frame = std::min(n + d->radius, d->src_vi->numFrames - 1);
+
+        for (int i = start_frame; i <= end_frame; ++i) {
+            vsapi->requestFrameFilter(i, d->node, frameCtx);
+        }
+        vsapi->requestFrameFilter(n, d->src_node, frameCtx);
+    } else if (activationReason == arAllFramesReady) {
+        const VSFrameRef * src_frame = vsapi->getFrameFilter(n, d->src_node, frameCtx);
+
+        std::vector<const VSFrameRef *> frames;
+        frames.reserve(2 * d->radius + 1);
+        for (int i = n - d->radius; i <= n + d->radius; ++i) {
+            auto frame_id = std::clamp(i, 0, d->src_vi->numFrames - 1);
+            frames.emplace_back(vsapi->getFrameFilter(frame_id, d->node, frameCtx));
+        }
+
+        float * buffer {};
+        {
+            const auto thread_id = std::this_thread::get_id();
+            bool init = true;
+
+            d->buffer_lock.lock_shared();
+
+            try {
+                const auto & const_buffer = d->buffer;
+                buffer = const_buffer.at(thread_id);
+            } catch (const std::out_of_range &) {
+                init = false;
+            }
+
+            d->buffer_lock.unlock_shared();
+
+            if (!init) {
+                assert(d->process[0] || d->src_vi->format->numPlanes > 1);
+
+                const int max_height {
+                    d->process[0] ?
+                    vsapi->getFrameHeight(src_frame, 0) :
+                    vsapi->getFrameHeight(src_frame, 1)
+                };
+                const int max_width {
+                    d->process[0] ?
+                    vsapi->getFrameWidth(src_frame, 0) :
+                    vsapi->getFrameWidth(src_frame, 1)
+                };
+
+                buffer = reinterpret_cast<float *>(std::malloc(2 * max_height * max_width * sizeof(float)));
+
+                std::lock_guard _ { d->buffer_lock };
+                d->buffer.emplace(thread_id, buffer);
+            }
+        }
+
+        const VSFrameRef * fr[] {
+            d->process[0] ? nullptr : src_frame,
+            d->process[1] ? nullptr : src_frame,
+            d->process[2] ? nullptr : src_frame
+        };
+        constexpr int pl[] { 0, 1, 2 };
+        auto dst_frame = vsapi->newVideoFrame2(
+            d->src_vi->format,
+            d->src_vi->width, d->src_vi->height,
+            fr, pl, src_frame, core);
+
+        for (int plane = 0; plane < d->src_vi->format->numPlanes; ++plane) {
+            if (d->process[plane]) {
+                int plane_width = vsapi->getFrameWidth(src_frame, plane);
+                int plane_height = vsapi->getFrameHeight(src_frame, plane);
+                int plane_stride = vsapi->getStride(src_frame, plane) / sizeof(float);
+
+                std::memset(buffer, 0, 2 * plane_height * plane_width * sizeof(float));
+
+                for (int i = 0; i < 2 * d->radius + 1; ++i) {
+                    auto agg_src = reinterpret_cast<const float *>(vsapi->getReadPtr(frames[i], plane));
+                    agg_src += (2 * d->radius - i) * 2 * plane_height * plane_stride;
+
+                    float * agg_dst = buffer;
+
+                    for (int y = 0; y < 2 * plane_height; ++y) {
+                        for (int x = 0; x < plane_width; ++x) {
+                            agg_dst[x] += agg_src[x];
+                        }
+                        agg_src += plane_stride;
+                        agg_dst += plane_width;
+                    }
+                }
+
+                auto dstp = reinterpret_cast<float *>(vsapi->getWritePtr(dst_frame, plane));
+                aggregation(dstp, buffer, plane_width, plane_height, plane_stride);
+            }
+        }
+
+        for (const auto & frame : frames) {
+            vsapi->freeFrame(frame);
+        }
+        vsapi->freeFrame(src_frame);
+
+        return dst_frame;
+    }
+
+    return nullptr;
+}
+
+static void VS_CC VAggregateFree(
+    void *instanceData, VSCore *core, const VSAPI *vsapi
+) noexcept {
+
+    auto * d = static_cast<VAggregateData *>(instanceData);
+
+    for (const auto & [_, ptr] : d->buffer) {
+        std::free(ptr);
+    }
+
+    vsapi->freeNode(d->src_node);
+    vsapi->freeNode(d->node);
+
+    delete d;
+}
+
+static void VS_CC VAggregateCreate(
+    const VSMap *in, VSMap *out, void *userData,
+    VSCore *core, const VSAPI *vsapi
+) noexcept {
+
+    auto d = std::make_unique<VAggregateData>();
+
+    d->node = vsapi->propGetNode(in, "clip", 0, nullptr);
+    auto vi = vsapi->getVideoInfo(d->node);
+    d->src_node = vsapi->propGetNode(in, "src", 0, nullptr);
+    d->src_vi = vsapi->getVideoInfo(d->src_node);
+
+    d->radius = (vi->height / d->src_vi->height - 2) / 4;
+
+    d->process.fill(false);
+    int num_planes_args = vsapi->propNumElements(in, "planes");
+    for (int i = 0; i < num_planes_args; ++i) {
+        int plane = vsapi->propGetInt(in, "planes", i, nullptr);
+        d->process[plane] = true;
+    }
+
+    VSCoreInfo core_info;
+    vsapi->getCoreInfo2(core, &core_info);
+    d->buffer.reserve(core_info.numThreads);
+
+    vsapi->createFilter(
+        in, out, "VAggregate",
+        VAggregateInit, VAggregateGetFrame, VAggregateFree,
+        fmParallel, 0, d.release(), core);
+}
+
+static void VS_CC WNNMCreate(
+    const VSMap *in, VSMap *out, void *userData,
+    VSCore *core, const VSAPI *vsapi
+) noexcept {
+
+    std::array<bool, 3> process;
+    process.fill(true);
+
+    int num_sigma_args = vsapi->propNumElements(in, "sigma");
+    for (int i = 0; i < std::min(3, num_sigma_args); ++i) {
+        auto sigma = vsapi->propGetFloat(in, "sigma", i, nullptr);
+        if (sigma < std::numeric_limits<float>::epsilon()) {
+            process[i] = false;
+        }
+    }
+
+    bool skip = true;
+    auto src = vsapi->propGetNode(in, "clip", 0, nullptr);
+    auto src_vi = vsapi->getVideoInfo(src);
+    for (int i = 0; i < src_vi->format->numPlanes; ++i) {
+        skip &= !process[i];
+    }
+    if (skip) {
+        vsapi->propSetNode(out, "clip", src, paReplace);
+        vsapi->freeNode(src);
+        return ;
+    }
+
+    auto map = vsapi->invoke(myself, "WNNMRaw", in);
+    if (auto error = vsapi->getError(map); error) {
+        vsapi->setError(out, error);
+        vsapi->freeMap(map);
+        vsapi->freeNode(src);
+        return ;
+    }
+
+    int error;
+    int radius = vsapi->propGetInt(in, "radius", 0, &error);
+    if (error) {
+        radius = 0;
+    }
+    if (radius == 0) {
+        // spatial WNNM should handle everything itself
+        auto node = vsapi->propGetNode(map, "clip", 0, nullptr);
+        vsapi->freeMap(map);
+        vsapi->propSetNode(out, "clip", node, paReplace);
+        vsapi->freeNode(node);
+        vsapi->freeNode(src);
+        return ;
+    }
+
+    vsapi->propSetNode(map, "src", src, paReplace);
+    vsapi->freeNode(src);
+
+    for (int i = 0; i < 3; ++i) {
+        if (process[i]) {
+            vsapi->propSetInt(map, "planes", i, paAppend);
+        }
+    }
+
+    auto map2 = vsapi->invoke(myself, "VAggregate", map);
+    vsapi->freeMap(map);
+    if (auto error = vsapi->getError(map2); error) {
+        vsapi->setError(out, error);
+        vsapi->freeMap(map2);
+        return ;
+    }
+
+    auto node = vsapi->propGetNode(map2, "clip", 0, nullptr);
+    vsapi->freeMap(map2);
+    vsapi->propSetNode(out, "clip", node, paReplace);
+    vsapi->freeNode(node);
+}
+
+VS_EXTERNAL_API(void) VapourSynthPluginInit(
+    VSConfigPlugin configFunc, VSRegisterFunction registerFunc, VSPlugin *plugin
+) noexcept {
+
+    myself = plugin;
+
     configFunc(
-        "com.WolframRhodium.WNNM",
+        "com.wolframrhodium.wnnm",
         "wnnm", "Weighted Nuclear Norm Minimization Denoiser",
         VAPOURSYNTH_API_VERSION, 1, plugin
     );
 
-    registerFunc("WNNM",
+    constexpr auto wnnm_args {
         "clip:clip;"
         "sigma:float[]:opt;"
         "block_size:int:opt;"
         "block_step:int:opt;"
         "group_size:int:opt;"
         "bm_range:int:opt;"
+        "radius:int:opt;"
+        "ps_num:int:opt;"
+        "ps_range:int:opt;"
         "residual:int:opt;"
         "adaptive_aggregation:int:opt;"
-        "fast:int:opt;",
-        WNNMCreate, nullptr, plugin
-    );
+    };
+
+    registerFunc("WNNMRaw", wnnm_args, WNNMRawCreate, nullptr, plugin);
+
+    registerFunc(
+        "VAggregate",
+        "clip:clip;"
+        "src:clip;"
+        "planes:int[];",
+        VAggregateCreate, nullptr, plugin);
+
+    registerFunc("WNNM", wnnm_args, WNNMCreate, nullptr, plugin);
 
     auto getVersion = [](const VSMap *, VSMap * out, void *, VSCore *, const VSAPI *vsapi) {
         vsapi->propSetData(out, "version", VERSION, -1, paReplace);
 
-        vsapi->propSetData(out, "mkl_version_build", std::to_string(INTEL_MKL_VERSION).c_str(), -1, paReplace);
+        std::ostringstream mkl_version_build_str;
+        mkl_version_build_str << __INTEL_MKL__ << '.' << __INTEL_MKL_MINOR__ << '.' << __INTEL_MKL_UPDATE__;
+
+        vsapi->propSetData(out, "mkl_version_build", mkl_version_build_str.str().c_str(), -1, paReplace);
 
         MKLVersion version;
         mkl_get_version(&version);
