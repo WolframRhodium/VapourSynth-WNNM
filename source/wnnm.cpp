@@ -1,7 +1,6 @@
 #include <algorithm>
 #include <array>
 #include <cassert>
-#include <cfloat>
 #include <cmath>
 #include <cstddef>
 #include <cstring>
@@ -58,7 +57,7 @@ struct Workspace {
 
     void init(
         int width, int height,
-        int block_size, int group_size, int bm_range, int radius,
+        int block_size, int group_size, int radius,
         bool residual,
         int svd_lda, int svd_ldu, int svd_ldvt, int svd_lwork
     ) noexcept {
@@ -465,7 +464,7 @@ static inline void load_patches_avx2(
     std::conditional_t<residual, float * VS_RESTRICT, std::nullptr_t> mean_patch,
     const std::vector<const float *> & srcps,
     const std::vector<std::tuple<float, int, int, int>> & errors,
-    int width, int height, int stride,
+    int stride,
     int active_group_size,
     int block_size
 ) noexcept {
@@ -563,7 +562,7 @@ static inline void load_patches(
     std::conditional_t<residual, float * VS_RESTRICT, std::nullptr_t> mean_patch,
     const std::vector<const float *> & srcps,
     const std::vector<std::tuple<float, int, int, int>> & errors,
-    int width, int height, int stride,
+    int stride,
     int active_group_size,
     int block_size
 ) noexcept {
@@ -572,19 +571,19 @@ static inline void load_patches(
     if (block_size == 8) {
         return load_patches_avx2<BlockSizeInfo::Is8, residual>(
             denoising_patch, svd_lda, mean_patch,
-            srcps, errors, width, height, stride,
+            srcps, errors, stride,
             active_group_size, block_size
         );
     } else if ((block_size % 8) == 0) { // block_size % 8 == 0
         return load_patches_avx2<BlockSizeInfo::Mod8, residual>(
             denoising_patch, svd_lda, mean_patch,
-            srcps, errors, width, height, stride,
+            srcps, errors, stride,
             active_group_size, block_size
         );
     } else { // block_size % 8 != 0
         return load_patches_avx2<BlockSizeInfo::General, residual>(
             denoising_patch, svd_lda, mean_patch,
-            srcps, errors, width, height, stride,
+            srcps, errors, stride,
             active_group_size, block_size
         );
     }
@@ -658,7 +657,7 @@ static inline int block_matching(
     const std::vector<const float *> & srcps, // length: 2 * radius + 1
     int width, int height, int stride,
     int x, int y,
-    int block_size, int block_step, int group_size, int bm_range,
+    int block_size, int group_size, int bm_range,
     int ps_num, int ps_range
 ) noexcept {
 
@@ -753,7 +752,7 @@ static inline int block_matching(
 
     load_patches<residual>(
         denoising_patch, svd_lda, mean_patch,
-        srcps, errors, width, height, stride, active_group_size, block_size);
+        srcps, errors, stride, active_group_size, block_size);
 
     if constexpr (residual) {
         bm_post(mean_patch, denoising_patch, block_size, active_group_size, svd_lda);
@@ -857,7 +856,7 @@ static inline void col2im(
     float * VS_RESTRICT intermediate,
     const float * VS_RESTRICT denoising_patch, int svd_lda,
     const std::vector<std::tuple<float, int, int, int>> & errors,
-    int width, int height, int intermediate_stride,
+    int height, int intermediate_stride,
     int block_size, int active_group_size,
     float adaptive_weight
 ) noexcept {
@@ -887,7 +886,7 @@ static void patch_estimation_skip(
     float * VS_RESTRICT intermediate,
     const std::vector<const float *> & srcps,
     const std::vector<std::tuple<float, int, int, int>> & errors,
-    int width, int height, int stride, int intermediate_stride,
+    int height, int stride, int intermediate_stride,
     int block_size, int active_group_size
 ) noexcept {
 
@@ -965,7 +964,7 @@ static void process(
     no_subnormals();
 #endif
 
-    Workspace workspace;
+    Workspace workspace {};
     bool init = true;
 
     d->workspaces_lock.lock_shared();
@@ -984,7 +983,7 @@ static void process(
     if (!init) {
         workspace.init(
             vi->width, vi->height,
-            d->block_size, d->group_size, d->bm_range, d->radius,
+            d->block_size, d->group_size, d->radius,
             d->residual,
             d->svd_lda, d->svd_ldu, d->svd_ldvt, d->svd_lwork
         );
@@ -994,7 +993,7 @@ static void process(
         d->workspaces_lock.unlock();
     }
 
-    std::conditional_t<residual, float * VS_RESTRICT, std::nullptr_t> mean_patch;
+    std::conditional_t<residual, float * VS_RESTRICT, std::nullptr_t> mean_patch {};
     if constexpr (residual) {
         mean_patch = workspace.mean_patch;
     }
@@ -1043,7 +1042,7 @@ static void process(
                     // inputs
                     srcps, width, height, stride,
                     x, y,
-                    d->block_size, d->block_step, d->group_size, d->bm_range,
+                    d->block_size, d->group_size, d->bm_range,
                     d->ps_num, d->ps_range
                 );
 
@@ -1069,7 +1068,7 @@ static void process(
                                 workspace.intermediate,
                                 // inputs
                                 workspace.denoising_patch, d->svd_lda,
-                                errors, width, height, width,
+                                errors, height, width,
                                 d->block_size, active_group_size, adaptive_weight
                             );
                         } else {
@@ -1078,7 +1077,7 @@ static void process(
                                 dstp,
                                 // inputs
                                 workspace.denoising_patch, d->svd_lda,
-                                errors, width, height, stride,
+                                errors, height, stride,
                                 d->block_size, active_group_size, adaptive_weight
                             );
                         }
@@ -1089,7 +1088,7 @@ static void process(
                             patch_estimation_skip(
                                 // output
                                 workspace.intermediate, srcps,
-                                errors, width, height, stride, width,
+                                errors, height, stride, width,
                                 d->block_size, active_group_size
                             );
                         } else {
@@ -1098,7 +1097,7 @@ static void process(
                                 dstp,
                                 // inputs
                                 srcps,
-                                errors, width, height, stride, stride,
+                                errors, height, stride, stride,
                                 d->block_size, active_group_size
                             );
                         }
@@ -1500,7 +1499,7 @@ static void VS_CC VAggregateCreate(
     d->process.fill(false);
     int num_planes_args = vsapi->propNumElements(in, "planes");
     for (int i = 0; i < num_planes_args; ++i) {
-        int plane = vsapi->propGetInt(in, "planes", i, nullptr);
+        int plane = int64ToIntS(vsapi->propGetInt(in, "planes", i, nullptr));
         d->process[plane] = true;
     }
 
@@ -1550,9 +1549,9 @@ static void VS_CC WNNMCreate(
         return ;
     }
 
-    int error;
-    int radius = vsapi->propGetInt(in, "radius", 0, &error);
-    if (error) {
+    int err;
+    int radius = int64ToIntS(vsapi->propGetInt(in, "radius", 0, &err));
+    if (err) {
         radius = 0;
     }
     if (radius == 0) {
