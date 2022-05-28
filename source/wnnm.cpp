@@ -4,14 +4,15 @@
 #include <cmath>
 #include <cstddef>
 #include <cstring>
-#include <limits>
 #include <iterator>
+#include <limits>
 #include <shared_mutex>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
 #include <tuple>
+#include <type_traits>
 #include <unordered_map>
 #include <vector>
 
@@ -54,6 +55,10 @@ struct Workspace {
     float * svd_vt; // shape: (min(square(block_size), group_size), svd_ldvt)
     float * svd_work; // shape: (svd_lwork,)
     int * svd_iwork; // shape: (8 * min(square(block_size), group_size),)
+    std::vector<std::tuple<float, int, int, int>> * errors; // shape: dynamic
+    std::vector<std::tuple<float, int, int>> * center_errors; // shape: dynamic
+    std::vector<std::tuple<int, int>> * search_locations; // shape: dynamic
+    std::vector<std::tuple<int, int>> * new_locations; // shape: dynamic
 
     void init(
         int width, int height,
@@ -96,6 +101,11 @@ struct Workspace {
         svd_work = vs_aligned_malloc<float>(svd_lwork * sizeof(float), 64);
 
         svd_iwork = vs_aligned_malloc<int>(8 * std::min(m, n) * sizeof(int), 64);
+
+        errors = new std::remove_pointer_t<decltype(errors)>;
+        center_errors = new std::remove_pointer_t<decltype(center_errors)>;
+        search_locations = new std::remove_pointer_t<decltype(search_locations)>;
+        new_locations = new std::remove_pointer_t<decltype(new_locations)>;
     }
 
     void release() noexcept {
@@ -125,6 +135,18 @@ struct Workspace {
 
         vs_aligned_free(svd_iwork);
         svd_iwork = nullptr;
+
+        delete errors;
+        errors = nullptr;
+
+        delete center_errors;
+        center_errors = nullptr;
+
+        delete search_locations;
+        search_locations = nullptr;
+
+        delete new_locations;
+        new_locations = nullptr;
     }
 };
 
@@ -234,7 +256,7 @@ static inline void compute_block_distances_avx2(
 
             float error { horizontal_add(vec_error) };
 
-            errors.emplace_back(std::make_tuple(error, bm_x, bm_y));
+            errors.emplace_back(error, bm_x, bm_y);
 
             neighbour_patch++;
         }
@@ -317,18 +339,19 @@ static inline void compute_block_distances_avx2(
 
         float error { horizontal_add(vec_error) };
 
-        errors.emplace_back(std::make_tuple(error, bm_x, bm_y));
+        errors.emplace_back(error, bm_x, bm_y);
     }
 }
 #endif // __AVX2__
 
-static std::vector<std::tuple<int, int>> generate_search_locations(
+static inline void generate_search_locations(
     const std::tuple<float, int, int> * center_positions, int num_center_positions,
-    int block_size, int width, int height, int bm_range
+    int block_size, int width, int height, int bm_range,
+    std::vector<std::tuple<int, int>> & search_locations,
+    std::vector<std::tuple<int, int>> & new_locations
 ) noexcept {
 
-    std::vector<std::tuple<int, int>> search_locations;
-    std::vector<std::tuple<int, int>> new_locations;
+    search_locations.clear();
 
     for (int i = 0; i < num_center_positions; i++) {
         const auto & [_, x, y] = center_positions[i];
@@ -341,7 +364,7 @@ static std::vector<std::tuple<int, int>> generate_search_locations(
         new_locations.reserve((bottom - top + 1) * (right - left + 1));
         for (int j = top; j <= bottom; j++) {
             for (int k = left; k <= right; k++) {
-                new_locations.emplace_back(std::make_tuple(k, j));
+                new_locations.emplace_back(k, j);
             }
         }
 
@@ -362,8 +385,6 @@ static std::vector<std::tuple<int, int>> generate_search_locations(
             }
         );
     }
-
-    return search_locations;
 }
 
 static inline void compute_block_distances(
@@ -400,7 +421,7 @@ static inline void compute_block_distances(
                 neighbour_patchp += stride;
             }
 
-            errors.emplace_back(std::make_tuple(error, bm_x, bm_y));
+            errors.emplace_back(error, bm_x, bm_y);
 
             neighbour_patch++;
         }
@@ -452,7 +473,7 @@ static inline void compute_block_distances(
             neighbour_patchp += stride;
         }
 
-        errors.emplace_back(std::make_tuple(error, bm_x, bm_y));
+        errors.emplace_back(error, bm_x, bm_y);
     }
 #endif // __AVX2__
 }
@@ -644,7 +665,7 @@ static inline void extend_errors(
 
     errors.reserve(std::size(errors) + std::size(spatial_errors));
     for (const auto & [error, x, y] : spatial_errors) {
-        errors.emplace_back(std::make_tuple(error, x, y, temporal_index));
+        errors.emplace_back(error, x, y, temporal_index);
     }
 }
 
@@ -658,10 +679,14 @@ static inline int block_matching(
     int width, int height, int stride,
     int x, int y,
     int block_size, int group_size, int bm_range,
-    int ps_num, int ps_range
+    int ps_num, int ps_range,
+    std::vector<std::tuple<float, int, int>> & center_errors,
+    std::vector<std::tuple<int, int>> & search_locations,
+    std::vector<std::tuple<int, int>> & new_locations
 ) noexcept {
 
     errors.clear();
+    center_errors.clear();
 
     auto radius = (static_cast<int>(std::size(srcps)) - 1) / 2;
 
@@ -670,8 +695,6 @@ static inline int block_matching(
         &srcps[radius][y * stride + x], stride * sizeof(float),
         block_size * sizeof(float), block_size
     );
-
-    std::vector<std::tuple<float, int, int>> center_errors;
 
     int top = std::max(y - bm_range, 0);
     int bottom = std::min(y + bm_range, height - block_size);
@@ -705,9 +728,10 @@ static inline int block_matching(
             for (int i = 1; i <= radius; i++) {
                 auto temporal_index = radius + direction * i;
 
-                auto search_locations = generate_search_locations(
+                generate_search_locations(
                     std::data(temporal_errors), active_ps_num,
-                    block_size, width, height, ps_range
+                    block_size, width, height, ps_range,
+                    search_locations, new_locations
                 );
 
                 temporal_errors.clear();
@@ -747,7 +771,7 @@ static inline int block_matching(
         }
     }
     if (!center) {
-        errors.insert(std::begin(errors), std::make_tuple(0.0f, x, y, radius));
+        errors[0] = std::make_tuple(0.0f, x, y, radius);
     }
 
     load_patches<residual>(
@@ -998,7 +1022,7 @@ static void process(
         mean_patch = workspace.mean_patch;
     }
 
-    std::vector<std::tuple<float, int, int, int>> errors;
+    std::vector<std::tuple<float, int, int, int>> & errors = *workspace.errors;
 
     for (int plane = 0; plane < vi->format->numPlanes; plane++) {
         if (!d->process[plane]) {
@@ -1043,7 +1067,10 @@ static void process(
                     srcps, width, height, stride,
                     x, y,
                     d->block_size, d->group_size, d->bm_range,
-                    d->ps_num, d->ps_range
+                    d->ps_num, d->ps_range,
+                    *workspace.center_errors,
+                    *workspace.search_locations,
+                    *workspace.new_locations
                 );
 
                 // patch_estimation with early skipping on SVD exception
