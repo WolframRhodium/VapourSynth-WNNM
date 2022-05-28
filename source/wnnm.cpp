@@ -712,15 +712,24 @@ static inline int block_matching(
     if (radius == 0) {
         extend_errors(errors, center_errors, radius);
     } else {
-        int active_ps_num = std::min(ps_num, static_cast<int>(std::size(center_errors)));
+        int active_ps_num = std::min(
+            ps_num,
+            static_cast<int>(std::size(center_errors))
+        );
+
+        int active_num = std::min(
+            std::max(group_size, ps_num),
+            static_cast<int>(std::size(center_errors))
+        );
+
         std::partial_sort(
             center_errors.begin(),
-            center_errors.begin() + active_ps_num,
+            center_errors.begin() + active_num,
             center_errors.end(),
             [](auto a, auto b) { return std::get<0>(a) < std::get<0>(b); }
         );
+        center_errors.resize(active_num);
         extend_errors(errors, center_errors, radius);
-        center_errors.resize(active_ps_num);
 
         for (int direction = -1; direction <= 1; direction += 2) {
             auto temporal_errors = center_errors; // mutable
@@ -744,12 +753,18 @@ static inline int block_matching(
                     stride, block_size
                 );
 
+                auto active_temporal_num = std::min(
+                    std::max(group_size, ps_num),
+                    static_cast<int>(std::size(temporal_errors))
+                );
+
                 std::partial_sort(
                     temporal_errors.begin(),
-                    temporal_errors.begin() + std::min(ps_num, static_cast<int>(std::size(temporal_errors))),
+                    temporal_errors.begin() + active_temporal_num,
                     temporal_errors.end(),
                     [](auto a, auto b) { return std::get<0>(a) < std::get<0>(b); }
                 );
+                temporal_errors.resize(active_temporal_num);
                 extend_errors(errors, temporal_errors, temporal_index);
             }
         }
