@@ -1016,7 +1016,7 @@ static void process(
         float * const VS_RESTRICT dstp = reinterpret_cast<float *>(vsapi->getWritePtr(dst, plane));
 
         if (d->radius == 0) {
-            std::memset(workspace.intermediate, 0, height * width * sizeof(float));
+            std::memset(workspace.intermediate, 0, 2 * height * width * sizeof(float));
         } else {
             std::memset(dstp, 0, 2 * (2 * d->radius + 1) * height * stride * sizeof(float));
         }
