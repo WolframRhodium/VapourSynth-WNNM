@@ -59,6 +59,8 @@ struct Workspace {
     std::vector<std::tuple<float, int, int>> * center_errors; // shape: dynamic
     std::vector<std::tuple<int, int>> * search_locations; // shape: dynamic
     std::vector<std::tuple<int, int>> * new_locations; // shape: dynamic
+    std::vector<std::tuple<int, int>> * locations_copy; // shape: dynamic
+    std::vector<std::tuple<float, int, int>> * temporal_errors; // shape: dynamic
 
     void init(
         int width, int height,
@@ -106,6 +108,8 @@ struct Workspace {
         center_errors = new std::remove_pointer_t<decltype(center_errors)>;
         search_locations = new std::remove_pointer_t<decltype(search_locations)>;
         new_locations = new std::remove_pointer_t<decltype(new_locations)>;
+        locations_copy = new std::remove_pointer_t<decltype(locations_copy)>;
+        temporal_errors = new std::remove_pointer_t<decltype(temporal_errors)>;
     }
 
     void release() noexcept {
@@ -147,6 +151,12 @@ struct Workspace {
 
         delete new_locations;
         new_locations = nullptr;
+
+        delete locations_copy;
+        locations_copy = nullptr;
+
+        delete temporal_errors;
+        temporal_errors = nullptr;
     }
 };
 
@@ -348,7 +358,8 @@ static inline void generate_search_locations(
     const std::tuple<float, int, int> * center_positions, int num_center_positions,
     int block_size, int width, int height, int bm_range,
     std::vector<std::tuple<int, int>> & search_locations,
-    std::vector<std::tuple<int, int>> & new_locations
+    std::vector<std::tuple<int, int>> & new_locations,
+    std::vector<std::tuple<int, int>> & locations_copy
 ) noexcept {
 
     search_locations.clear();
@@ -368,7 +379,7 @@ static inline void generate_search_locations(
             }
         }
 
-        auto locations_copy = search_locations;
+        locations_copy = search_locations;
 
         search_locations.reserve(std::size(search_locations) + std::size(new_locations));
 
@@ -682,7 +693,9 @@ static inline int block_matching(
     int ps_num, int ps_range,
     std::vector<std::tuple<float, int, int>> & center_errors,
     std::vector<std::tuple<int, int>> & search_locations,
-    std::vector<std::tuple<int, int>> & new_locations
+    std::vector<std::tuple<int, int>> & new_locations,
+    std::vector<std::tuple<int, int>> & locations_copy,
+    std::vector<std::tuple<float, int, int>> & temporal_errors
 ) noexcept {
 
     errors.clear();
@@ -732,7 +745,7 @@ static inline int block_matching(
         extend_errors(errors, center_errors, radius);
 
         for (int direction = -1; direction <= 1; direction += 2) {
-            auto temporal_errors = center_errors; // mutable
+            temporal_errors = center_errors; // mutable
 
             for (int i = 1; i <= radius; i++) {
                 auto temporal_index = radius + direction * i;
@@ -740,7 +753,7 @@ static inline int block_matching(
                 generate_search_locations(
                     std::data(temporal_errors), active_ps_num,
                     block_size, width, height, ps_range,
-                    search_locations, new_locations
+                    search_locations, new_locations, locations_copy
                 );
 
                 temporal_errors.clear();
@@ -1085,7 +1098,9 @@ static void process(
                     d->ps_num, d->ps_range,
                     *workspace.center_errors,
                     *workspace.search_locations,
-                    *workspace.new_locations
+                    *workspace.new_locations,
+                    *workspace.locations_copy,
+                    *workspace.temporal_errors
                 );
 
                 // patch_estimation with early skipping on SVD exception
