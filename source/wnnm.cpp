@@ -1219,9 +1219,9 @@ static const VSFrameRef *VS_CC WNNMRawGetFrame(
 
         const auto & center_src = srcs[d->radius];
         const VSFrameRef * fr[] {
-            d->process[0] ? nullptr : center_src,
-            d->process[1] ? nullptr : center_src,
-            d->process[2] ? nullptr : center_src
+            (d->process[0] || d->radius != 0) ? nullptr : center_src,
+            (d->process[1] || d->radius != 0) ? nullptr : center_src,
+            (d->process[2] || d->radius != 0) ? nullptr : center_src
         };
         const int pl[] { 0, 1, 2 };
         VSFrameRef * dst;
