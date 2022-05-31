@@ -1218,21 +1218,17 @@ static const VSFrameRef *VS_CC WNNMRawGetFrame(
         }
 
         const auto & center_src = srcs[d->radius];
-        const VSFrameRef * fr[] {
-            (d->process[0] || d->radius != 0) ? nullptr : center_src,
-            (d->process[1] || d->radius != 0) ? nullptr : center_src,
-            (d->process[2] || d->radius != 0) ? nullptr : center_src
-        };
-        const int pl[] { 0, 1, 2 };
         VSFrameRef * dst;
         if (d->radius == 0) {
+            const VSFrameRef * fr[] {
+                d->process[0] ? nullptr : center_src,
+                d->process[1] ? nullptr : center_src,
+                d->process[2] ? nullptr : center_src
+            };
+            const int pl[] { 0, 1, 2 };
             dst = vsapi->newVideoFrame2(vi->format, vi->width, vi->height, fr, pl, center_src, core);
         } else {
-            dst = vsapi->newVideoFrame2(
-                vi->format,
-                vi->width, 2 * (2 * d->radius + 1) * vi->height,
-                fr, pl, center_src, core
-            );
+            dst = vsapi->newVideoFrame(vi->format, vi->width, 2 * (2 * d->radius + 1) * vi->height, center_src, core);
         }
 
         if (d->residual) {
