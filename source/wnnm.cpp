@@ -167,6 +167,7 @@ struct WNNMData {
     int radius, ps_num, ps_range;
     bool process[3];
     bool residual, adaptive_aggregation;
+    VSNodeRef * ref_node; // rclip
     int svd_lwork, svd_lda, svd_ldu, svd_ldvt;
 
     std::unordered_map<std::thread::id, Workspace> workspaces;
@@ -279,7 +280,7 @@ template <BlockSizeInfo dispatch>
 static inline void compute_block_distances_avx2(
     std::vector<std::tuple<float, int, int>> & errors,
     const float * VS_RESTRICT current_patch,
-    const float * VS_RESTRICT srcp,
+    const float * VS_RESTRICT refp,
     const std::vector<std::tuple<int, int>> & search_positions,
     int stride, int block_size
 ) noexcept {
@@ -297,7 +298,7 @@ static inline void compute_block_distances_avx2(
         Vec8f vec_error {0.f};
 
         const float * VS_RESTRICT current_patchp = current_patch;
-        const float * VS_RESTRICT neighbour_patchp = &srcp[bm_y * stride + bm_x];
+        const float * VS_RESTRICT neighbour_patchp = &refp[bm_y * stride + bm_x];
 
         for (int patch_y = 0; patch_y < block_size; ++patch_y) {
             if constexpr (dispatch == BlockSizeInfo::Is8) {
@@ -445,7 +446,7 @@ static inline void compute_block_distances(
 static inline void compute_block_distances(
     std::vector<std::tuple<float, int, int>> & errors,
     const float * VS_RESTRICT current_patch,
-    const float * VS_RESTRICT srcp,
+    const float * VS_RESTRICT refp,
     const std::vector<std::tuple<int, int>> & search_positions,
     int stride,
     int block_size
@@ -455,17 +456,17 @@ static inline void compute_block_distances(
     if (block_size == 8) {
         return compute_block_distances_avx2<BlockSizeInfo::Is8>(
             errors,
-            current_patch, srcp, search_positions, stride, block_size
+            current_patch, refp, search_positions, stride, block_size
         );
     } else if ((block_size % 8) == 0) {
         return compute_block_distances_avx2<BlockSizeInfo::Mod8>(
             errors,
-            current_patch, srcp, search_positions, stride, block_size
+            current_patch, refp, search_positions, stride, block_size
         );
     } else {
         return compute_block_distances_avx2<BlockSizeInfo::General>(
             errors,
-            current_patch, srcp, search_positions, stride, block_size
+            current_patch, refp, search_positions, stride, block_size
         );
     }
 #else // __AVX2__
@@ -473,7 +474,7 @@ static inline void compute_block_distances(
         float error = 0.f;
 
         const float * VS_RESTRICT current_patchp = current_patch;
-        const float * VS_RESTRICT neighbour_patchp = &srcp[bm_y * stride + bm_x];
+        const float * VS_RESTRICT neighbour_patchp = &refp[bm_y * stride + bm_x];
 
         for (int patch_y = 0; patch_y < block_size; ++patch_y) {
             for (int patch_x = 0; patch_x < block_size; ++patch_x) {
@@ -687,6 +688,7 @@ static inline int block_matching(
     float * VS_RESTRICT current_patch,
     std::conditional_t<residual, float * VS_RESTRICT, std::nullptr_t> mean_patch,
     const std::vector<const float *> & srcps, // length: 2 * radius + 1
+    const std::vector<const float *> & refps, // length: 2 * radius + 1
     int width, int height, int stride,
     int x, int y,
     int block_size, int group_size, int bm_range,
@@ -705,7 +707,7 @@ static inline int block_matching(
 
     vs_bitblt(
         current_patch, block_size * sizeof(float),
-        &srcps[radius][y * stride + x], stride * sizeof(float),
+        &refps[radius][y * stride + x], stride * sizeof(float),
         block_size * sizeof(float), block_size
     );
 
@@ -717,7 +719,7 @@ static inline int block_matching(
     compute_block_distances(
         center_errors,
         current_patch,
-        &srcps[radius][top * stride + left],
+        &refps[radius][top * stride + left],
         top, bottom, left, right,
         stride, block_size
     );
@@ -761,7 +763,7 @@ static inline int block_matching(
                 compute_block_distances(
                     temporal_errors,
                     current_patch,
-                    srcps[temporal_index],
+                    refps[temporal_index],
                     search_locations,
                     stride, block_size
                 );
@@ -1004,6 +1006,7 @@ static inline void aggregation(
 template<bool residual>
 static void process(
     const std::vector<const VSFrameRef *> & srcs,
+    const std::vector<const VSFrameRef *> & refs,
     VSFrameRef * dst,
     WNNMData * d,
     const VSAPI * vsapi
@@ -1065,6 +1068,11 @@ static void process(
         for (const auto & src : srcs) {
             srcps.emplace_back(reinterpret_cast<const float *>(vsapi->getReadPtr(src, plane)));
         }
+        std::vector<const float *> refps;
+        refps.reserve(std::size(refs));
+        for (const auto & ref : refs) {
+            refps.emplace_back(reinterpret_cast<const float *>(vsapi->getReadPtr(ref, plane)));
+        }
         float * const VS_RESTRICT dstp = reinterpret_cast<float *>(vsapi->getWritePtr(dst, plane));
 
         if (d->radius == 0) {
@@ -1092,7 +1100,7 @@ static void process(
                     errors,
                     workspace.current_patch, mean_patch,
                     // inputs
-                    srcps, width, height, stride,
+                    srcps, refps, width, height, stride,
                     x, y,
                     d->block_size, d->group_size, d->bm_range,
                     d->ps_num, d->ps_range,
@@ -1207,6 +1215,11 @@ static const VSFrameRef *VS_CC WNNMRawGetFrame(
         for (int i = start_frame; i <= end_frame; ++i) {
             vsapi->requestFrameFilter(i, d->node, frameCtx);
         }
+        if (d->ref_node) {
+            for (int i = start_frame; i <= end_frame; ++i) {
+                vsapi->requestFrameFilter(i, d->ref_node, frameCtx);
+            }
+        }
     } else if (activationReason == arAllFramesReady) {
         auto vi = vsapi->getVideoInfo(d->node);
 
@@ -1215,6 +1228,17 @@ static const VSFrameRef *VS_CC WNNMRawGetFrame(
         for (int i = -d->radius; i <= d->radius; i++) {
             auto frame_id = std::clamp(n + i, 0, vi->numFrames - 1);
             srcs.emplace_back(vsapi->getFrameFilter(frame_id, d->node, frameCtx));
+        }
+
+        std::vector<const VSFrameRef *> refs;
+        if (d->ref_node) {
+            refs.reserve(2 * d->radius + 1);
+            for (int i = -d->radius; i <= d->radius; i++) {
+                auto frame_id = std::clamp(n + i, 0, vi->numFrames - 1);
+                refs.emplace_back(vsapi->getFrameFilter(frame_id, d->ref_node, frameCtx));
+            }
+        } else {
+            refs = srcs;
         }
 
         const auto & center_src = srcs[d->radius];
@@ -1232,13 +1256,19 @@ static const VSFrameRef *VS_CC WNNMRawGetFrame(
         }
 
         if (d->residual) {
-            process<true>(srcs, dst, d, vsapi);
+            process<true>(srcs, refs, dst, d, vsapi);
         } else {
-            process<false>(srcs, dst, d, vsapi);
+            process<false>(srcs, refs, dst, d, vsapi);
         }
 
         for (const auto & src : srcs) {
             vsapi->freeFrame(src);
+        }
+
+        if (d->ref_node) {
+            for (const auto & ref : refs) {
+                vsapi->freeFrame(ref);
+            }
         }
 
         return dst;
@@ -1254,6 +1284,10 @@ static void VS_CC WNNMRawFree(
     auto d = static_cast<WNNMData *>(instanceData);
 
     vsapi->freeNode(d->node);
+
+    if (d->ref_node) {
+        vsapi->freeNode(d->ref_node);
+    }
 
     for (auto & [_, workspace] : d->workspaces) {
         workspace.release();
@@ -1369,6 +1403,16 @@ static void VS_CC WNNMRawCreate(
     d->adaptive_aggregation = !!vsapi->propGetInt(in, "adaptive_aggregation", 0, &error);
     if (error) {
         d->adaptive_aggregation = true;
+    }
+
+    d->ref_node = vsapi->propGetNode(in, "rclip", 0, &error);
+    if (error) {
+        d->ref_node = nullptr;
+    } else {
+        auto ref_vi = vsapi->getVideoInfo(d->ref_node);
+        if (!isSameFormat(vi, ref_vi) || vi->numFrames != ref_vi->numFrames) {
+            return set_error("\"rclip\" must be of the same format and number of frames as \"clip\"");
+        }
     }
 
     VSCoreInfo core_info;
@@ -1664,6 +1708,7 @@ VS_EXTERNAL_API(void) VapourSynthPluginInit(
         "ps_range:int:opt;"
         "residual:int:opt;"
         "adaptive_aggregation:int:opt;"
+        "rclip:clip:opt;"
     };
 
     registerFunc("WNNMRaw", wnnm_args, WNNMRawCreate, nullptr, plugin);
