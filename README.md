@@ -44,9 +44,9 @@ For spatial denoising, the block-matching implemented is the same as the officia
 
 For temporal denoising, this implementation utilizes the same predictive search proposed by `V-BM3D`, which is closer to [VapourSynth-BM3D](https://github.com/HomeOfVapourSynthEvolution/VapourSynth-BM3D) (without dissimilar block thresholding) than [VapourSynth-BM3DCUDA](https://github.com/WolframRhodium/VapourSynth-BM3DCUDA). The later one implemented a modified temporal predictive search that may finds multiple instances of the same similar block for acceleration.
 
-During collaborative filtering, the official WNNM implementation centers blocks in the 3-D group. This is controlled by the `residual` parameter and is off by default. The major singular value is also always untouched, unlike the official implementation.
+During collaborative filtering, the official WNNM implementation centers blocks in the 3-D group. This is controlled by the `residual` parameter and is off by default. The major singular value is untouched when `residual` is off.
 
-**Note**: Because of WNNM and the modification, the maximum denoising effect achieved is the best rank-one approximation of the 3-D group when `residual` is on, or the mean of the group when `residual` is off, which may not be enough for strong noises. The official implementation uses iterative regularization, which can be easily implemented as
+**Note**: Because of WNNM and the modification, the maximum denoising effect achieved is the best rank-one approximation of the 3-D group when `residual` is off, or the mean of the group when `residual` is on, which may not be enough for strong noises. The official implementation uses iterative regularization, which can be easily implemented as
 ```python
 for i in range(num_iterations):
     if i == 0:
