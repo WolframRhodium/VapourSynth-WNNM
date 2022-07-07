@@ -6,7 +6,7 @@
 
 Block matching, which is popularized by `BM3D`, finds similar blocks and then stacks together in a 3-D group. The similarity between these blocks allows details to be preserved during denoising.
 
-In contrast to `BM3D`, which denoises the 3-D group based on frequency domain filtering, `WNNM` utilizes weighted nuclear norm minimization, a kind of low rank matrix approximation. Because of this, `WNNM` exhibits less blocking artifact compared to `BM3D`, but the computational complexity is much higher. This stage is called collaborative filtering in `BM3D`.
+In contrast to `BM3D`, which denoises the 3-D group based on frequency domain filtering, `WNNM` utilizes weighted nuclear norm minimization, a kind of low rank matrix approximation. Because of this, `WNNM` exhibits less blocking and ringing artifact compared to `BM3D`, but the computational complexity is much higher. This stage is called collaborative filtering in `BM3D`.
 
 ## Usage
 Prototype:
@@ -46,7 +46,7 @@ For temporal denoising, this implementation utilizes the same predictive search 
 
 During collaborative filtering, the official WNNM implementation centers blocks in the 3-D group. This is controlled by the `residual` parameter and is off by default. The major singular value is also always untouched, unlike the official implementation.
 
-**Note**: Because of WNNM and the modification, the maximum denoising effect achieved is the best rank-one approximation of the 3-D group, which may not be enough for strong noises. The official implementation uses iterative regularization, which can be easily implemented as
+**Note**: Because of WNNM and the modification, the maximum denoising effect achieved is the best rank-one approximation of the 3-D group when `residual` is on, or the mean of the group when `residual` is off, which may not be enough for strong noises. The official implementation uses iterative regularization, which can be easily implemented as
 ```python
 for i in range(num_iterations):
     if i == 0:
