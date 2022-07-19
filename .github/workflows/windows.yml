@@ -6,6 +6,10 @@ on:
       - 'source/*'
       - '.github/workflows/windows.yml'
   workflow_dispatch:
+    inputs:
+      tag:
+        description: 'which tag to upload to'
+        default: ''
 
 jobs:
   build-windows:
@@ -84,3 +88,17 @@ jobs:
         name: wnnm-windows-x64
         path: artifact
 
+    - name: Compress artifact for release
+      if: github.event_name == 'workflow_dispatch' && github.event.inputs.tag != ''
+      run: |
+        cd artifact
+
+        mkdir VapourSynth-WNNM-${{ github.event.inputs.tag }}
+        7z a -t7z -mx=9 ../VapourSynth-WNNM-${{ github.event.inputs.tag }}.7z wnnm.dll
+
+    - name: Release
+      uses: softprops/action-gh-release@v1
+      if: github.event_name == 'workflow_dispatch' && github.event.inputs.tag != ''
+      with:
+        tag_name: ${{ github.event.inputs.tag }}
+        files: VapourSynth-WNNM-${{ github.event.inputs.tag }}.7z
