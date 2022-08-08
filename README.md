@@ -38,7 +38,7 @@ Prototype:
     Reference clip for block matching. Must be of the same dimensions and format as `clip`.
 
 ## Implementation
-The defaulting `block_size`, `block_step`, `group_size` are modified for acceleration.
+Default values of `block_size`, `block_step`, `group_size` are modified for acceleration.
 
 For spatial denoising, the block-matching implemented is the same as the official implementation, which is similar to that of `BM3D` without setting a threshold on whether dissimilar blocks should be included in the 3-D group. This is the same strategy implemented in [VapourSynth-BM3DCUDA](https://github.com/WolframRhodium/VapourSynth-BM3DCUDA) but not in [VapourSynth-BM3D](https://github.com/HomeOfVapourSynthEvolution/VapourSynth-BM3D).
 
