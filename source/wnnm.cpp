@@ -1590,6 +1590,21 @@ static void VS_CC VAggregateCreate(
     VSCore *core, const VSAPI *vsapi
 ) noexcept {
 
+    {
+        int error;
+        bool internal = !!vsapi->propGetInt(in, "internal", 0, &error);
+        if (error) {
+            internal = false;
+        }
+        if (!internal) {
+            vsapi->setError(
+                out,
+                "this interface is for internal use only, please use \"wnnm.WNNM()\" directly"
+            );
+            return ;
+        }
+    }
+
     auto d = std::make_unique<VAggregateData>();
 
     d->node = vsapi->propGetNode(in, "clip", 0, nullptr);
@@ -1676,6 +1691,8 @@ static void VS_CC WNNMCreate(
         }
     }
 
+    vsapi->propSetInt(map, "internal", 1, paReplace);
+
     auto map2 = vsapi->invoke(myself, "VAggregate", map);
     vsapi->freeMap(map);
     if (auto error = vsapi->getError(map2); error) {
@@ -1723,7 +1740,8 @@ VS_EXTERNAL_API(void) VapourSynthPluginInit(
         "VAggregate",
         "clip:clip;"
         "src:clip;"
-        "planes:int[];",
+        "planes:int[];"
+        "internal:int:opt;",
         VAggregateCreate, nullptr, plugin);
 
     registerFunc("WNNM", wnnm_args, WNNMCreate, nullptr, plugin);
