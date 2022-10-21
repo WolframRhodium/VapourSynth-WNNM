@@ -20,7 +20,7 @@ jobs:
 
     steps:
     - name: Checkout repo
-      uses: actions/checkout@v2
+      uses: actions/checkout@v3
       with:
         fetch-depth: 0
 
@@ -29,7 +29,7 @@ jobs:
 
     - name: Cache oneMKL
       id: cache-onemkl
-      uses: actions/cache@v2
+      uses: actions/cache@v3
       with:
         path: C:\Program Files (x86)\Intel\oneAPI\mkl
         key: ${{ runner.os }}-onemkl-2022.2.0
@@ -83,7 +83,7 @@ jobs:
         copy install\bin\wnnm.dll artifact\
 
     - name: Upload
-      uses: actions/upload-artifact@v2
+      uses: actions/upload-artifact@v3
       with:
         name: wnnm-windows-x64
         path: artifact
