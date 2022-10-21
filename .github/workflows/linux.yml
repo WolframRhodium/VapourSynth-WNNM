@@ -9,17 +9,12 @@ on:
 
 jobs:
   build-linux:
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-22.04
     steps:
     - name: Checkout repo
-      uses: actions/checkout@v2
+      uses: actions/checkout@v3
       with:
         fetch-depth: 0
-
-    - name: Setup GCC
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y g++-11
 
     - name: Setup oneMKL
       run: |
@@ -60,7 +55,7 @@ jobs:
       run: cmake --install build --prefix install
 
     - name: Upload
-      uses: actions/upload-artifact@v2
+      uses: actions/upload-artifact@v3
       if: true
       with:
         name: wnnm-linux
