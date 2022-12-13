@@ -1646,8 +1646,10 @@ static void VS_CC WNNMCreate(
             process[i] = false;
         }
     }
-    for (int i = num_sigma_args; i < 3; ++i) {
-        process[i] = process[i - 1];
+    if (num_sigma_args > 0) { // num_sigma_args may be -1
+        for (int i = num_sigma_args; i < 3; ++i) {
+            process[i] = process[i - 1];
+        }
     }
 
     bool skip = true;
