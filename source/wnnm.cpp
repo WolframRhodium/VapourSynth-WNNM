@@ -1646,6 +1646,9 @@ static void VS_CC WNNMCreate(
             process[i] = false;
         }
     }
+    for (int i = num_sigma_args; i < 3; ++i) {
+        process[i] = process[i - 1];
+    }
 
     bool skip = true;
     auto src = vsapi->propGetNode(in, "clip", 0, nullptr);
