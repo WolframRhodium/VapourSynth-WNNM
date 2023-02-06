@@ -59,7 +59,7 @@ if(GIT_FOUND)
 endif()
 
 if(VCS_TAG)
-    message(STATUS "vs-nlm-ispc ${VCS_TAG}")
+    message(STATUS "vs-wnnm ${VCS_TAG}")
 else()
     message(WARNING "unknown plugin version")
     set(VCS_TAG "unknown")
