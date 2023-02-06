@@ -1351,7 +1351,7 @@ static void VS_CC WNNMRawCreate(
     d->block_step = int64ToIntS(vsapi->propGetInt(in, "block_step", 0, &error));
     if (error) {
         // d->block_step = 6;
-        d->block_step = 8; // follows the change in block_step
+        d->block_step = d->block_size;
     } else if (d->block_step <= 0 || d->block_step > d->block_size) {
         return set_error("\"block_step\" must be positive and no larger than \"block_size\"");
     }
