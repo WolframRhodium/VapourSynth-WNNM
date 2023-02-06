@@ -1345,7 +1345,7 @@ static void VS_CC WNNMRawCreate(
         // d->block_size = 6;
         d->block_size = 8; // more optimized
     } else if (d->block_size <= 0) {
-        return set_error("\"sigma\" must be positive");
+        return set_error("\"block_size\" must be positive");
     }
 
     d->block_step = int64ToIntS(vsapi->propGetInt(in, "block_step", 0, &error));
