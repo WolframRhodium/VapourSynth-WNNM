@@ -821,7 +821,7 @@ static inline WnnmInfo patch_estimation(
     float & adaptive_weight,
     float sigma,
     int block_size, int active_group_size,
-    float * VS_RESTRICT mean_patch,
+    const float * VS_RESTRICT mean_patch,
     bool adaptive_aggregation,
     float * VS_RESTRICT svd_s,
     float * VS_RESTRICT svd_u, int svd_ldu,
