@@ -695,7 +695,7 @@ static inline void load_patches(
 #elif defined(__ARM_FEATURE_SVE)
     const int step = static_cast<int>(svlen(svfloat32_t{}));
 
-    for (int i = 0, index = 0; i < active_group_size; ++i) {
+    for (int i = 0; i < active_group_size; ++i) {
         auto [error, bm_x, bm_y, bm_t] = errors[i];
 
         const float * VS_RESTRICT src_patchp = &srcps[bm_t][bm_y * stride + bm_x];
@@ -726,7 +726,7 @@ static inline void load_patches(
         denoising_patch += svd_lda - square(block_size);
     }
 #else
-    for (int i = 0, index = 0; i < active_group_size; ++i) {
+    for (int i = 0; i < active_group_size; ++i) {
         auto [error, bm_x, bm_y, bm_t] = errors[i];
 
         const float * VS_RESTRICT src_patchp = &srcps[bm_t][bm_y * stride + bm_x];
