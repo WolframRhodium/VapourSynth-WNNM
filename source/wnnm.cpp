@@ -16,7 +16,7 @@
 #include <unordered_map>
 #include <vector>
 
-#if defined(__x86_64__) && defined(_M_AMD64)
+#if defined(__x86_64__) || defined(_M_AMD64)
 // MKL
 #include <mkl_blas.h>
 #include <mkl_lapack.h>
@@ -938,6 +938,16 @@ static inline WnnmInfo patch_estimation(
     int n = active_group_size;
 
     int svd_info;
+#if defined(__INTEL_MKL__)
+    sgesdd(
+        "S", &m, &n,
+        denoising_patch, &svd_lda,
+        svd_s,
+        svd_u, &svd_ldu,
+        svd_vt, &svd_ldvt,
+        svd_work, &svd_lwork, svd_iwork, &svd_info
+    );
+#else
     sgesdd_(
         "S", &m, &n,
         denoising_patch, &svd_lda,
@@ -946,6 +956,7 @@ static inline WnnmInfo patch_estimation(
         svd_vt, &svd_ldvt,
         svd_work, &svd_lwork, svd_iwork, &svd_info
     );
+#endif // defined(__INTEL_MKL__)
 
     if (svd_info != 0) {
         return WnnmInfo::FAILURE;
@@ -996,7 +1007,11 @@ static inline WnnmInfo patch_estimation(
 
     constexpr float alpha = 1.0f;
     constexpr float beta = 0.0f;
+#if defined(__INTEL_MKL__)
+    sgemm("N", "N", &m, &n, &k, &alpha, svd_u, &svd_ldu, svd_vt, &svd_ldvt, &beta, denoising_patch, &svd_lda);
+#else
     sgemm_("N", "N", &m, &n, &k, &alpha, svd_u, &svd_ldu, svd_vt, &svd_ldvt, &beta, denoising_patch, &svd_lda);
+#endif // defined(__INTEL_MKL__)
 
     if constexpr (residual) {
         for (int i = 0; i < active_group_size; ++i) {
