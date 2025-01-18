@@ -3,14 +3,27 @@ cmake_minimum_required(VERSION 3.22.0)
 project(vs-wnnm VERSION 0.1 LANGUAGES CXX)
 
 set(VCL_HOME "" CACHE PATH "Path to vector class v2 headers")
-
-find_package(MKL CONFIG REQUIRED)
+set(ARMPL_HOME "" CACHE PATH "Path to Arm Performance Libraries")
 
 add_library(wnnm SHARED source/wnnm.cpp)
 
-target_include_directories(wnnm PRIVATE ${VCL_HOME})
+if(CMAKE_SYSTEM_PROCESSOR STREQUAL "AMD64")
+    find_package(MKL CONFIG REQUIRED)
 
-target_link_libraries(wnnm PRIVATE $<LINK_ONLY:MKL::MKL>)
+    target_include_directories(wnnm PRIVATE ${VCL_HOME})
+
+    target_link_libraries(wnnm PRIVATE $<LINK_ONLY:MKL::MKL>)
+elseif(CMAKE_SYSTEM_PROCESSOR STREQUAL "ARM64")
+    cmake_path(join TEMP_PATH "${ARMPL_HOME}" "include")
+    target_include_directories(wnnm PRIVATE TEMP_PATH)
+
+    cmake_path(join TEMP_PATH "${ARMPL_HOME}" "lib")
+    target_link_directories(wnnm PRIVATE TEMP_PATH)
+
+    target_link_libraries(wnnm PRIVATE armpl_lp64)
+ else()
+    message(SEND_ERROR "unknown target: ${CMAKE_SYSTEM_PROCESSOR}")
+ endif()
 
 set_target_properties(wnnm PROPERTIES
     CXX_EXTENSIONS OFF
