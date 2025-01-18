@@ -14,11 +14,11 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "amd64.*|x86_64.*|AMD64.*")
 
     target_link_libraries(wnnm PRIVATE $<LINK_ONLY:MKL::MKL>)
 elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64.*|AARCH64.*|arm64.*|ARM64.*|armv8.*)")
-    cmake_path(join TEMP_PATH "${ARMPL_HOME}" "include")
-    target_include_directories(wnnm PRIVATE TEMP_PATH)
+    cmake_path(APPEND TEMP_PATH "${ARMPL_HOME}" "include")
+    target_include_directories(wnnm PRIVATE "${TEMP_PATH}")
 
-    cmake_path(join TEMP_PATH "${ARMPL_HOME}" "lib")
-    target_link_directories(wnnm PRIVATE TEMP_PATH)
+    cmake_path(APPEND TEMP_PATH "${ARMPL_HOME}" "lib")
+    target_link_directories(wnnm PRIVATE "${TEMP_PATH}")
 
     target_link_libraries(wnnm PRIVATE armpl_lp64)
  else()
