@@ -1,0 +1,55 @@
+name: Build (Linux, ARM64)
+
+on:
+  push:
+    paths:
+      - 'source/*'
+      - 'CMakeLists.txt'
+      - '.github/workflows/linux-arm64.yml'
+  workflow_dispatch:
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-24.04-arm
+    steps:
+    - name: Checkout repo
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Setup ArmPL
+      run: |
+        wget -q -O armpl.tar https://developer.arm.com/-/cdn-downloads/permalink/Arm-Performance-Libraries/Version_24.10/arm-performance-libraries_24.10_deb_gcc.tar
+        tar -xf armpl.tar
+        sudo arm-performance-libraries_24.10_deb/arm-performance-libraries_24.10_deb.sh -a
+        /opt/arm/armpl_24.10_gcc/bin/armpl-info
+
+    - name: Download VapourSynth headers
+      run: |
+        wget -q -O vs.zip https://github.com/vapoursynth/vapoursynth/archive/refs/tags/R57.zip
+        unzip -q vs.zip
+        mv vapoursynth*/ vapoursynth
+
+    - name: Setup Ninja
+      run: pip install ninja
+
+    - name: Configure
+      run: cmake -S . -B build -G Ninja -LA
+        -D CMAKE_BUILD_TYPE=Release
+        -D CMAKE_CXX_FLAGS="-Wall -ffast-math"
+        -D ARMPL_HOME=/opt/arm/armpl_24.10_gcc
+        -D VS_INCLUDE_DIR="`pwd`/vapoursynth/include"
+
+    - name: Build
+      run: cmake --build build --verbose
+
+    - name: Install
+      run: cmake --install build --prefix install
+
+    - name: Upload
+      uses: actions/upload-artifact@v4
+      if: true
+      with:
+        name: wnnm-linux
+        path: install/lib/*.so
+
