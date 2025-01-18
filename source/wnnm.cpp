@@ -16,6 +16,7 @@
 #include <unordered_map>
 #include <vector>
 
+#if defined(__x86_64__) && defined(_M_AMD64)
 // MKL
 #include <mkl_blas.h>
 #include <mkl_lapack.h>
@@ -25,6 +26,17 @@
 #ifdef __AVX2__
 #include <vectorclass.h>
 #include <immintrin.h>
+#endif // __AVX2__
+
+#elif defined(__aarch64__) || defined(_M_ARM64)
+#include <armpl.h>
+
+#ifdef __ARM_FEATURE_SVE
+#include <arm_sve.h>
+#endif // __ARM_FEATURE_SVE
+
+#else
+#error "unknown target"
 #endif
 
 #include <VapourSynth.h>
@@ -71,6 +83,8 @@ struct Workspace {
 
 #ifdef __AVX2__
         constexpr int pad = 7;
+#elif defined(__ARM_FEATURE_SVE)
+        const int pad = static_cast<int>(svlen(svfloat32_t{})) - 1;
 #else
         constexpr int pad = 0;
 #endif
@@ -416,6 +430,38 @@ static inline void compute_block_distances(
     } else {
         return compute_block_distances_avx2<BlockSizeInfo::General>(errors, current_patch, neighbour_patch, top, bottom, left, right, stride, block_size);
     }
+#elif defined(__ARM_FEATURE_SVE)
+    const int step = static_cast<int>(svlen(svfloat32_t{}));
+
+    for (int bm_y = top; bm_y <= bottom; ++bm_y) {
+        for (int bm_x = left; bm_x <= right; ++bm_x) {
+            svfloat32_t error {};
+
+            const float * VS_RESTRICT current_patchp = current_patch;
+            const float * VS_RESTRICT neighbour_patchp = neighbour_patch;
+
+            for (int patch_y = 0; patch_y < block_size; ++patch_y) {
+                for (int patch_x = 0; patch_x < block_size; patch_x += step) {
+                    auto predicate = svwhilelt_b32(patch_x, block_size);
+
+                    auto current = svld1(predicate, &current_patchp[patch_x]);
+                    auto neighbour = svld1(predicate, &neighbour_patchp[patch_x]);
+
+                    auto diff = svsub_z(predicate, current, neighbour);
+                    error = svmad_z(predicate, diff, diff, error);
+                }
+
+                current_patchp += block_size;
+                neighbour_patchp += stride;
+            }
+
+            errors.emplace_back(svaddv(svptrue_b32(), error), bm_x, bm_y);
+
+            neighbour_patch++;
+        }
+
+        neighbour_patch += stride - (right - left + 1);
+    }
 #else // __AVX2__
     for (int bm_y = top; bm_y <= bottom; ++bm_y) {
         for (int bm_x = left; bm_x <= right; ++bm_x) {
@@ -469,7 +515,33 @@ static inline void compute_block_distances(
             current_patch, refp, search_positions, stride, block_size
         );
     }
-#else // __AVX2__
+#elif defined(__ARM_FEATURE_SVE)
+    const int step = static_cast<int>(svlen(svfloat32_t{}));
+
+    for (const auto & [bm_x, bm_y]: search_positions) {
+        svfloat32_t error {};
+
+        const float * VS_RESTRICT current_patchp = current_patch;
+        const float * VS_RESTRICT neighbour_patchp = &refp[bm_y * stride + bm_x];
+
+        for (int patch_y = 0; patch_y < block_size; ++patch_y) {
+            for (int patch_x = 0; patch_x < block_size; patch_x += step) {
+                auto predicate = svwhilelt_b32(patch_x, block_size);
+
+                auto current = svld1(predicate, &current_patchp[patch_x]);
+                auto neighbour = svld1(predicate, &neighbour_patchp[patch_x]);
+
+                auto diff = svsub_z(predicate, current, neighbour);
+                error = svmad_z(predicate, diff, diff, error);
+            }
+
+            current_patchp += block_size;
+            neighbour_patchp += stride;
+        }
+
+        errors.emplace_back(svaddv(svptrue_b32(), error), bm_x, bm_y);
+    }
+#else
     for (const auto & [bm_x, bm_y]: search_positions) {
         float error = 0.f;
 
@@ -620,7 +692,40 @@ static inline void load_patches(
             active_group_size, block_size
         );
     }
-#else // __AVX2__
+#elif defined(__ARM_FEATURE_SVE)
+    const int step = static_cast<int>(svlen(svfloat32_t{}));
+
+    for (int i = 0, index = 0; i < active_group_size; ++i) {
+        auto [error, bm_x, bm_y, bm_t] = errors[i];
+
+        const float * VS_RESTRICT src_patchp = &srcps[bm_t][bm_y * stride + bm_x];
+
+        float * VS_RESTRICT mean_patchp {nullptr};
+        if constexpr (residual) {
+            mean_patchp = mean_patch;
+        }
+
+        for (int patch_y = 0; patch_y < block_size; ++patch_y) {
+            for (int patch_x = 0; patch_x < block_size; patch_x += step) {
+                auto predicate = svwhilelt_b32(patch_x, block_size);
+
+                auto src_val = svld1(predicate, &src_patchp[patch_x]);
+
+                svst1(predicate, &denoising_patch[patch_x], src_val);
+
+                if constexpr (residual) {
+                    auto mean_val = svld1(predicate, &mean_patchp[patch_x]);
+                    svst1(predicate, &mean_patchp[patch_x], svadd_z(predicate, mean_val, src_val));
+                }
+            }
+
+            src_patchp += stride;
+            denoising_patch += block_size;
+        }
+
+        denoising_patch += svd_lda - square(block_size);
+    }
+#else
     for (int i = 0, index = 0; i < active_group_size; ++i) {
         auto [error, bm_x, bm_y, bm_t] = errors[i];
 
@@ -833,7 +938,7 @@ static inline WnnmInfo patch_estimation(
     int n = active_group_size;
 
     int svd_info;
-    sgesdd(
+    sgesdd_(
         "S", &m, &n,
         denoising_patch, &svd_lda,
         svd_s,
@@ -891,7 +996,7 @@ static inline WnnmInfo patch_estimation(
 
     constexpr float alpha = 1.0f;
     constexpr float beta = 0.0f;
-    sgemm("N", "N", &m, &n, &k, &alpha, svd_u, &svd_ldu, svd_vt, &svd_ldvt, &beta, denoising_patch, &svd_lda);
+    sgemm_("N", "N", &m, &n, &k, &alpha, svd_u, &svd_ldu, svd_vt, &svd_ldvt, &beta, denoising_patch, &svd_lda);
 
     if constexpr (residual) {
         for (int i = 0; i < active_group_size; ++i) {
@@ -1754,6 +1859,7 @@ VS_EXTERNAL_API(void) VapourSynthPluginInit(
     auto getVersion = [](const VSMap *, VSMap * out, void *, VSCore *, const VSAPI *vsapi) {
         vsapi->propSetData(out, "version", VERSION, -1, paReplace);
 
+#if defined(__INTEL_MKL__)
         std::ostringstream mkl_version_build_str;
         mkl_version_build_str << __INTEL_MKL__ << '.' << __INTEL_MKL_MINOR__ << '.' << __INTEL_MKL_UPDATE__;
 
@@ -1768,6 +1874,16 @@ VS_EXTERNAL_API(void) VapourSynthPluginInit(
         mkl_version_str << version.MajorVersion << '.' << version.MinorVersion << '.' << version.UpdateVersion;
 
         vsapi->propSetData(out, "mkl_version", mkl_version_str.str().c_str(), -1, paReplace);
+#else
+        int major, minor, patch;
+        const char * tag;
+        armplversion(&major, &minor, &patch, &tag);
+
+        std::ostringstream armpl_version;
+        armpl_version << major << '.' << minor << '.' << patch << '.' << tag;
+        vsapi->propSetData(out, "armpl_version", armpl_version.str().c_str(), -1, paReplace);
+#endif
     };
     registerFunc("Version", "", getVersion, nullptr, plugin);
 }
+
