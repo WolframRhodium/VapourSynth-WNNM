@@ -7,13 +7,13 @@ set(ARMPL_HOME "" CACHE PATH "Path to Arm Performance Libraries")
 
 add_library(wnnm SHARED source/wnnm.cpp)
 
-if(CMAKE_SYSTEM_PROCESSOR STREQUAL "AMD64")
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "amd64.*|x86_64.*|AMD64.*")
     find_package(MKL CONFIG REQUIRED)
 
     target_include_directories(wnnm PRIVATE ${VCL_HOME})
 
     target_link_libraries(wnnm PRIVATE $<LINK_ONLY:MKL::MKL>)
-elseif(CMAKE_SYSTEM_PROCESSOR STREQUAL "ARM64")
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64.*|AARCH64.*|arm64.*|ARM64.*|armv8.*)")
     cmake_path(join TEMP_PATH "${ARMPL_HOME}" "include")
     target_include_directories(wnnm PRIVATE TEMP_PATH)
 
