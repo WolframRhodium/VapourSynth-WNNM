@@ -4,6 +4,7 @@ on:
   push:
     paths:
       - 'source/*'
+      - 'CMakeLists.txt'
       - '.github/workflows/windows.yml'
   workflow_dispatch:
     inputs:
