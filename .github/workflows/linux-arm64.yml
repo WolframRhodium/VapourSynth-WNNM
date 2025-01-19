@@ -50,6 +50,26 @@ jobs:
       uses: actions/upload-artifact@v4
       if: true
       with:
-        name: wnnm-linux
+        name: wnnm-linux-armv8
         path: install/lib/*.so
+
+    - name: Configure (SVE)
+      run: cmake -S . -B build_sve -G Ninja -LA
+        -D CMAKE_BUILD_TYPE=Release
+        -D CMAKE_CXX_FLAGS="-Wall -ffast-math -march=armv8-a+sve"
+        -D ARMPL_HOME=/opt/arm/armpl_24.10_gcc
+        -D VS_INCLUDE_DIR="`pwd`/vapoursynth/include"
+
+    - name: Build (SVE)
+      run: cmake --build build_sve --verbose
+
+    - name: Install (SVE)
+      run: cmake --install build_sve --prefix install_sve
+
+    - name: Upload (SVE)
+      uses: actions/upload-artifact@v4
+      if: true
+      with:
+        name: wnnm-linux-armv8+sve
+        path: install_sve/lib/*.so
 
