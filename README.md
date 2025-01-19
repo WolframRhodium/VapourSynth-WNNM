@@ -64,16 +64,18 @@ The similar blocks are weightedly aggregated by the inverse of the number of non
 The block-matching can be guided by an oracle reference clip `rclip` in the same manner as `ref` for `BM3D`. The collaborative filtering is not guided, unlike `BM3D`.
 
 ## Compilation
-[oneMKL](https://www.intel.com/content/www/us/en/developer/tools/oneapi/onemkl.html) is required. [Vector class library](https://github.com/vectorclass/version2) is also required when compiling with AVX2.
+- On x86_64, [oneMKL](https://www.intel.com/content/www/us/en/developer/tools/oneapi/onemkl.html) is required. [Vector class library](https://github.com/vectorclass/version2) is also required when compiling with AVX2.
 
-```bash
-cmake -S . -B build -D CMAKE_BUILD_TYPE=Release \
--D MKL_LINK=static -D MKL_THREADING=sequential -D MKL_INTERFACE=lp64
+  ```bash
+  cmake -S . -B build -D CMAKE_BUILD_TYPE=Release \
+  -D MKL_LINK=static -D MKL_THREADING=sequential -D MKL_INTERFACE=lp64
 
-cmake --build build
+  cmake --build build
 
-cmake --install build
-```
+  cmake --install build
+  ```
+
+- On Aarch64, [ArmPL](https://developer.arm.com/Tools%20and%20Software/Arm%20Performance%20Libraries) is required.
 
 Example build process can be found in [workflows](https://github.com/WolframRhodium/VapourSynth-WNNM/tree/master/.github/workflows).
 
