@@ -17,33 +17,33 @@
 #include <vector>
 
 #if defined(__x86_64__) || defined(_M_AMD64)
-// MKL
-#include <mkl_blas.h>
-#include <mkl_lapack.h>
-#include <mkl_service.h>
-#include <mkl_version.h>
+    // MKL
+    #include <mkl_blas.h>
+    #include <mkl_lapack.h>
+    #include <mkl_service.h>
+    #include <mkl_version.h>
 
-#ifdef __AVX2__
-#include <vectorclass.h>
-#include <immintrin.h>
-#endif // __AVX2__
+    #ifdef __AVX2__
+        #include <vectorclass.h>
+        #include <immintrin.h>
+    #endif // __AVX2__
 
-#elif defined (__APPLE__ )
-#include <Accelerate/accelerate.h>
 
 #elif defined(__aarch64__) || defined(_M_ARM64)
-#include <armpl.h>
+    #if defined (__APPLE__ )
+        #include <Accelerate/accelerate.h>
+    #else
+        #include <armpl.h>
+    #endif //defined (__APPLE__ )
 
-#ifdef __ARM_FEATURE_SVE
-#include <arm_sve.h>
-#endif // __ARM_FEATURE_SVE
-
-#ifdef __ARM_NEON__
-#include <arm_neon.h>
-#endif //__ARM_NEON__
+    #ifdef __ARM_FEATURE_SVE
+        #include <arm_sve.h>
+    #elif __ARM_NEON__
+        #include <arm_neon.h>
+    #endif //__ARM_FEATURE_SVE
 
 #else
-#error "unknown target"
+    #error "unknown target"
 #endif
 
 #include <VapourSynth.h>
