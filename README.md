@@ -75,7 +75,7 @@ The block-matching can be guided by an oracle reference clip `rclip` in the same
   cmake --install build
   ```
 
-- On Aarch64, [ArmPL](https://developer.arm.com/Tools%20and%20Software/Arm%20Performance%20Libraries) is required.
+- On Aarch64, [ArmPL](https://developer.arm.com/Tools%20and%20Software/Arm%20Performance%20Libraries) is required, except for macOS (where [Accelerate](https://developer.apple.com/documentation/acceleratehttps://developer.apple.com/documentation/accelerate) framework is used).
 
 Example build process can be found in [workflows](https://github.com/WolframRhodium/VapourSynth-WNNM/tree/master/.github/workflows).
 
