@@ -14,16 +14,22 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "amd64.*|x86_64.*|AMD64.*")
 
     target_link_libraries(wnnm PRIVATE $<LINK_ONLY:MKL::MKL>)
 elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64.*|AARCH64.*|arm64.*|ARM64.*|armv8.*)")
-    cmake_path(APPEND TEMP_PATH "${ARMPL_HOME}" "include")
-    target_include_directories(wnnm PRIVATE "${TEMP_PATH}")
+    if(APPLE)
+        # On ARM macOS, use Accelerate framework
+        target_link_libraries(wnnm PRIVATE "-framework Accelerate")
+    else()
+        # On other ARM systems, use ARMPL
+        cmake_path(APPEND TEMP_PATH "${ARMPL_HOME}" "include")
+        target_include_directories(wnnm PRIVATE "${TEMP_PATH}")
 
-    cmake_path(APPEND TEMP_PATH "${ARMPL_HOME}" "lib")
-    target_link_directories(wnnm PRIVATE "${TEMP_PATH}")
+        cmake_path(APPEND TEMP_PATH "${ARMPL_HOME}" "lib")
+        target_link_directories(wnnm PRIVATE "${TEMP_PATH}")
 
-    target_link_libraries(wnnm PRIVATE armpl_lp64)
- else()
+        target_link_libraries(wnnm PRIVATE armpl_lp64)
+    endif()
+else()
     message(SEND_ERROR "unknown target: ${CMAKE_SYSTEM_PROCESSOR}")
- endif()
+endif()
 
 set_target_properties(wnnm PROPERTIES
     CXX_EXTENSIONS OFF

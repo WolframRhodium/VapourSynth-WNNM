@@ -17,26 +17,33 @@
 #include <vector>
 
 #if defined(__x86_64__) || defined(_M_AMD64)
-// MKL
-#include <mkl_blas.h>
-#include <mkl_lapack.h>
-#include <mkl_service.h>
-#include <mkl_version.h>
+    // MKL
+    #include <mkl_blas.h>
+    #include <mkl_lapack.h>
+    #include <mkl_service.h>
+    #include <mkl_version.h>
 
-#ifdef __AVX2__
-#include <vectorclass.h>
-#include <immintrin.h>
-#endif // __AVX2__
+    #ifdef __AVX2__
+        #include <vectorclass.h>
+        #include <immintrin.h>
+    #endif // __AVX2__
+
 
 #elif defined(__aarch64__) || defined(_M_ARM64)
-#include <armpl.h>
+    #if defined (__APPLE__ )
+        #include <Accelerate/accelerate.h>
+    #else
+        #include <armpl.h>
+    #endif //defined (__APPLE__ )
 
-#ifdef __ARM_FEATURE_SVE
-#include <arm_sve.h>
-#endif // __ARM_FEATURE_SVE
+    #ifdef __ARM_FEATURE_SVE
+        #include <arm_sve.h>
+    #elif __ARM_NEON__
+        #include <arm_neon.h>
+    #endif //__ARM_FEATURE_SVE
 
 #else
-#error "unknown target"
+    #error "unknown target"
 #endif
 
 #include <VapourSynth.h>
@@ -462,6 +469,47 @@ static inline void compute_block_distances(
 
         neighbour_patch += stride - (right - left + 1);
     }
+#elif defined(__ARM_NEON__)
+    for (int bm_y = top; bm_y <= bottom; ++bm_y) {
+        for (int bm_x = left; bm_x <= right; ++bm_x) {
+            float error = 0.0f;
+
+            float32x4_t errorVec = vdupq_n_f32(0.0f);
+
+            const float* VS_RESTRICT current_patchp   = current_patch;
+            const float* VS_RESTRICT neighbour_patchp = neighbour_patch;
+
+            for (int patch_y = 0; patch_y < block_size; ++patch_y) {
+                int patch_x = 0;
+
+                for (; patch_x + 4 <= block_size; patch_x += 4) {
+                    float32x4_t vCur = vld1q_f32(&current_patchp[patch_x]);
+                    float32x4_t vNei = vld1q_f32(&neighbour_patchp[patch_x]);
+                    float32x4_t vDiff = vsubq_f32(vCur, vNei);
+                    float32x4_t vMul  = vmulq_f32(vDiff, vDiff);
+
+                    errorVec = vaddq_f32(errorVec, vMul);
+                }
+
+                for (; patch_x < block_size; ++patch_x) {
+                    float diff = current_patchp[patch_x] - neighbour_patchp[patch_x];
+                    error += diff * diff;
+                }
+
+                current_patchp   += block_size;
+                neighbour_patchp += stride;
+            }
+
+            float neonSum = vaddvq_f32(errorVec);
+            error += neonSum;
+
+            errors.emplace_back(error, bm_x, bm_y);
+
+            neighbour_patch++;
+        }
+
+        neighbour_patch += stride - (right - left + 1);
+    }
 #else // __AVX2__
     for (int bm_y = top; bm_y <= bottom; ++bm_y) {
         for (int bm_x = left; bm_x <= right; ++bm_x) {
@@ -540,6 +588,41 @@ static inline void compute_block_distances(
         }
 
         errors.emplace_back(svaddv(svptrue_b32(), error), bm_x, bm_y);
+    }
+#elif defined(__ARM_NEON__)
+    for (size_t i = 0; i < search_positions.size(); i++) {
+        const auto& [bm_x, bm_y] = search_positions[i];
+
+        float error = 0.f;
+        float32x4_t errorVec = vdupq_n_f32(0.f);
+
+        const float* VS_RESTRICT current_patchp   = current_patch;
+        const float* VS_RESTRICT neighbour_patchp = &refp[bm_y * stride + bm_x];
+
+        for (int patch_y = 0; patch_y < block_size; ++patch_y) {
+            int patch_x = 0;
+            for (; patch_x + 4 <= block_size; patch_x += 4) {
+                float32x4_t vCur  = vld1q_f32(&current_patchp[patch_x]);
+                float32x4_t vNei  = vld1q_f32(&neighbour_patchp[patch_x]);
+                float32x4_t vDiff = vsubq_f32(vCur, vNei);
+                float32x4_t vMul  = vmulq_f32(vDiff, vDiff);
+                errorVec = vaddq_f32(errorVec, vMul);
+            }
+
+            for (; patch_x < block_size; ++patch_x) {
+                float diff = current_patchp[patch_x] - neighbour_patchp[patch_x];
+                error += diff * diff;
+            }
+
+            current_patchp   += block_size;
+            neighbour_patchp += stride;
+        }
+
+        float neonSum = vaddvq_f32(errorVec);
+
+        error += neonSum;
+
+        errors.emplace_back(error, bm_x, bm_y);
     }
 #else
     for (const auto & [bm_x, bm_y]: search_positions) {
@@ -1009,6 +1092,9 @@ static inline WnnmInfo patch_estimation(
     constexpr float beta = 0.0f;
 #if defined(__INTEL_MKL__)
     sgemm("N", "N", &m, &n, &k, &alpha, svd_u, &svd_ldu, svd_vt, &svd_ldvt, &beta, denoising_patch, &svd_lda);
+
+#elif defined(__APPLE__)
+    sgemm_("N", "N", &m, &n, &k, const_cast<float*>(&alpha), svd_u, &svd_ldu, svd_vt, &svd_ldvt, const_cast<float*>(&beta), denoising_patch, &svd_lda);
 #else
     sgemm_("N", "N", &m, &n, &k, &alpha, svd_u, &svd_ldu, svd_vt, &svd_ldvt, &beta, denoising_patch, &svd_lda);
 #endif // defined(__INTEL_MKL__)
@@ -1889,6 +1975,9 @@ VS_EXTERNAL_API(void) VapourSynthPluginInit(
         mkl_version_str << version.MajorVersion << '.' << version.MinorVersion << '.' << version.UpdateVersion;
 
         vsapi->propSetData(out, "mkl_version", mkl_version_str.str().c_str(), -1, paReplace);
+    
+#elif defined(__APPLE__)
+        vsapi->propSetData(out, "accelerate_version", "1", -1, paReplace); // I don't know how to fetch accelerate version.
 #else
         int major, minor, patch;
         const char * tag;
