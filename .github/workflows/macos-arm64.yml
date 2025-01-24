@@ -1,0 +1,46 @@
+name: Build (Macos, ARM64)
+
+on:
+  push:
+    paths:
+      - 'source/*'
+      - 'CMakeLists.txt'
+      - '.github/workflows/macos-arm64.yml'
+  workflow_dispatch:
+
+jobs:
+  build-macos:
+    runs-on: macos-latest
+    steps:
+    - name: Checkout repo
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Download VapourSynth headers
+      run: |
+        wget -q -O vs.zip https://github.com/vapoursynth/vapoursynth/archive/refs/tags/R57.zip
+        unzip -q vs.zip
+        mv vapoursynth*/ vapoursynth
+
+    - name: Setup Ninja
+      run: pip install ninja
+
+    - name: Configure
+      run: cmake -S . -B build -G Ninja -LA
+        -D CMAKE_BUILD_TYPE=Release
+        -D CMAKE_CXX_FLAGS="-Wall -ffast-math"
+        -D VS_INCLUDE_DIR="`pwd`/vapoursynth/include"
+
+    - name: Build
+      run: cmake --build build --verbose
+
+    - name: Install
+      run: cmake --install build --prefix install
+
+    - name: Upload
+      uses: actions/upload-artifact@v4
+      if: true
+      with:
+        name: wnnm-macos-AppleSoc
+        path: install/lib/*.dylib
